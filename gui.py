@@ -60,87 +60,92 @@ def _coletar_arquivos(entradas: list[Path]) -> list[tuple[Path, Path]]:
     return resultado
 
 
-# --------------------------------------------------------------------------- #
-#  Worker: roda o pipeline numa thread separada para não travar a janela.
-# --------------------------------------------------------------------------- #
-class Worker(QThread):
-    progresso = Signal(int, str)   # (porcentagem 0-100, texto de status)
-    terminou = Signal(list)        # lista de arquivos gerados
-    erro = Signal(str)             # mensagem de erro fatal
+# ── 2. WORKER ─────────────────────────────────────────────────────────────── #
 
-    def __init__(self, entrada: Path, opcoes: dict):
+
+class Worker(QThread):
+    progresso = Signal(int, str)
+    log      = Signal(str)
+    terminou = Signal(list, bool)   # (arquivos_gerados, cancelado)
+    erro     = Signal(str)
+
+    _cancelar: bool = False
+
+    def __init__(self, entradas: list[Path], opcoes: dict):
         super().__init__()
-        self.entrada = entrada
-        self.opcoes = opcoes       # {ocr, paginar, dividir, max_pag, txt, sem_cabecalho}
+        self.entradas = entradas
+        self.opcoes = opcoes
+
+    def requisitar_cancelamento(self) -> None:
+        self._cancelar = True
 
     def run(self):
         try:
             self._executar()
-        except Exception as e:                       # rede de segurança
+        except Exception as e:
             self.erro.emit(str(e))
 
     def _executar(self):
         op = self.opcoes
-        entrada = self.entrada
-
-        # 1) Reúne os PDFs (pasta -> recursivo; arquivo -> ele mesmo).
-        if entrada.is_dir():
-            arquivos = sorted(entrada.rglob("*.pdf"))
-        else:
-            arquivos = [entrada]
-        arquivos = [a for a in arquivos if "_limpo" not in a.stem]
-        if not arquivos:
+        pares = _coletar_arquivos(self.entradas)
+        if not pares:
             self.erro.emit("Nenhum PDF encontrado.")
             return
 
-        # 2) OCR: localiza Tesseract/idioma UMA vez (caro). lang vazio => sem OCR.
-        lang, cfg = ("", "")
+        lang, cfg = "", ""
         if op["ocr"]:
             self.progresso.emit(0, "Localizando o motor de OCR (Tesseract)...")
             lang, cfg = core._preparar_ocr()
             if not lang:
-                self.progresso.emit(0, "[aviso] OCR indisponível; seguindo sem OCR.")
-
-        base_saida = (entrada if entrada.is_dir() else entrada.parent) / "LIMPOS"
-        base_saida.mkdir(parents=True, exist_ok=True)
+                self.log.emit("[AVISO] OCR indisponível; seguindo sem OCR.")
 
         gerados: list[str] = []
-        total_arq = len(arquivos)
+        total = len(pares)
 
-        for k, arq in enumerate(arquivos):
-            pct_base = int(k / total_arq * 100)
-            self.progresso.emit(pct_base, f"Limpando {arq.name}...")
+        for k, (arq, pasta_saida) in enumerate(pares):
+            if self._cancelar:
+                break
 
-            destino = base_saida / arq.name
-            n = core.limpa_pdf(arq, destino, op["sem_cabecalho"])
+            pct = int(k / total * 100)
+            msg = f"[{k+1}/{total}] Limpando {arq.name}..."
+            self.progresso.emit(pct, msg)
+            self.log.emit(msg)
 
-            # OCR (se ligado e disponível)
+            pasta_saida.mkdir(parents=True, exist_ok=True)
+            destino = pasta_saida / arq.name
+            core.limpa_pdf(arq, destino, op["sem_cabecalho"])
+
+            if self._cancelar:
+                break
+
             if lang:
-                self.progresso.emit(pct_base, f"OCR em {arq.name} (pode demorar)...")
+                msg = f"[{k+1}/{total}] OCR em {arq.name} (pode demorar)..."
+                self.progresso.emit(pct, msg)
+                self.log.emit(msg)
                 try:
                     core.embutir_ocr(destino, lang, cfg)
                 except Exception as e:
-                    self.progresso.emit(pct_base, f"[aviso] OCR falhou: {e}")
+                    self.log.emit(f"[AVISO] OCR falhou: {e}")
 
-            # Paginação contínua — sobre o PDF INTEIRO, ANTES de dividir.
+                if self._cancelar:
+                    break
+
             if op["paginar"]:
-                self.progresso.emit(pct_base, f"Numerando páginas de {arq.name}...")
+                self.log.emit(f"[{k+1}/{total}] Numerando páginas de {arq.name}...")
                 try:
                     import pikepdf
                     with pikepdf.open(destino) as _p:
                         total_pag = len(_p.pages)
                     core.numerar_paginas(destino, total_pag, inicio=1)
                 except Exception as e:
-                    self.progresso.emit(pct_base, f"[aviso] numeração falhou: {e}")
+                    self.log.emit(f"[AVISO] Numeração falhou: {e}")
 
-            # Divisão — max_pag=0 significa "não dividir".
             max_pag = op["max_pag"] if op["dividir"] else 0
             try:
                 partes = core.dividir_pdf(destino, max_pag)
             except Exception:
                 partes = [(destino, 1)]
 
-            # TXT por parte, com offset (numeração contínua entre partes).
             for parte, offset in partes:
                 gerados.append(parte.name)
                 if op["txt"]:
@@ -154,10 +159,18 @@ class Worker(QThread):
                         if txt.is_file():
                             gerados.append(txt.name)
                     except Exception as e:
-                        self.progresso.emit(pct_base, f"[aviso] TXT falhou: {e}")
+                        self.log.emit(f"[AVISO] TXT falhou: {e}")
 
-        self.progresso.emit(100, "Concluído.")
-        self.terminou.emit(gerados)
+        cancelado = self._cancelar
+        if cancelado:
+            self.log.emit(
+                f"Cancelado. {len(gerados)} arquivo(s) gerado(s) antes do cancelamento."
+            )
+        else:
+            self.progresso.emit(100, "Concluído.")
+            self.log.emit(f"Concluído. {len(gerados)} arquivo(s) gerado(s).")
+
+        self.terminou.emit(gerados, cancelado)
 
 
 # --------------------------------------------------------------------------- #
@@ -314,7 +327,7 @@ class JanelaPrincipal(QWidget):
         self._travar_ui(True)
         self.barra.show(); self.barra.setValue(0)
 
-        self.worker = Worker(self.entrada, opcoes)
+        self.worker = Worker([self.entrada], opcoes)
         self.worker.progresso.connect(self._on_progresso)
         self.worker.terminou.connect(self._on_terminou)
         self.worker.erro.connect(self._on_erro)
@@ -324,9 +337,14 @@ class JanelaPrincipal(QWidget):
         self.barra.setValue(pct)
         self.lbl_status.setText(texto)
 
-    def _on_terminou(self, gerados: list):
+    def _on_terminou(self, gerados: list, cancelado: bool):
         self._travar_ui(False)
-        self.lbl_status.setText(f"Concluído. {len(gerados)} arquivo(s) gerado(s).")
+        if cancelado:
+            self.lbl_status.setText(
+                f"Cancelado. {len(gerados)} arquivo(s) gerado(s) antes do cancelamento."
+            )
+        else:
+            self.lbl_status.setText(f"Concluído. {len(gerados)} arquivo(s) gerado(s).")
         # TODO: botão "Abrir pasta de saída" (QDesktopServices.openUrl).
 
     def _on_erro(self, msg: str):
