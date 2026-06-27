@@ -28,14 +28,14 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtCore import Qt, QThread, Signal, QUrl
+from PySide6.QtGui import QFont, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QCheckBox, QSpinBox, QProgressBar, QFileDialog, QFrame, QSizePolicy,
+    QCheckBox, QSpinBox, QProgressBar, QFileDialog, QFrame, QPlainTextEdit,
+    QMessageBox,
 )
 
-# O núcleo. Renomeie o arquivo final para limpa_pdf_mpsc.py (sem acento/sufixo).
 import limpa_pdf_mpsc as core
 
 
@@ -58,6 +58,28 @@ def _coletar_arquivos(entradas: list[Path]) -> list[tuple[Path, Path]]:
                 vistos.add(arq)
                 resultado.append((arq, base))
     return resultado
+
+
+ESTILO_BTN_LIMPAR = (
+    "QPushButton { background-color: #003366; color: white; border-radius: 4px;"
+    " padding: 6px 16px; font-size: 13px; }"
+    "QPushButton:hover { background-color: #004488; }"
+    "QPushButton:disabled { background-color: #aaa; color: #eee; }"
+)
+ESTILO_BTN_CANCELAR = (
+    "QPushButton { background-color: #8b0000; color: white; border-radius: 4px;"
+    " padding: 6px 16px; font-size: 13px; }"
+    "QPushButton:hover { background-color: #a00000; }"
+    "QPushButton:disabled { background-color: #aaa; color: #eee; }"
+)
+APP_STYLESHEET = (
+    "QPlainTextEdit#log_area {"
+    "  background-color: #f5f5f5;"
+    "  border: 1px solid #ddd;"
+    "  font-family: Consolas, 'Courier New', monospace;"
+    "  font-size: 9pt;"
+    "}"
+)
 
 
 # ── 2. WORKER ─────────────────────────────────────────────────────────────── #
@@ -236,9 +258,6 @@ class AreaDrop(QFrame):
             self.entrada_definida.emit(paths)
 
 
-# --------------------------------------------------------------------------- #
-#  Janela principal.
-# --------------------------------------------------------------------------- #
 EXPLICACAO = (
     "Prepara procedimentos exportados do SIG para uso em ferramentas de "
     "inteligência artificial. Remove cabeçalhos e rodapés, apaga a assinatura "
@@ -248,21 +267,25 @@ EXPLICACAO = (
 )
 
 
+# ── 4. JANELA PRINCIPAL ───────────────────────────────────────────────────── #
+
+
 class JanelaPrincipal(QWidget):
     def __init__(self):
         super().__init__()
-        self.entrada: Path | None = None
+        self.entradas: list[Path] = []
         self.worker: Worker | None = None
+        self._processando: bool = False
+        self._pasta_saida: Path | None = None
         self.setWindowTitle("Limpa PDF — MPSC")
-        self.setAcceptDrops(True)               # drag-and-drop na janela inteira
-        self.setMinimumWidth(560)
+        self.setMinimumWidth(580)
         self._montar()
 
-    # ---- layout ----------------------------------------------------------- #
+    # ── layout ────────────────────────────────────────────────────────────── #
     def _montar(self):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(28, 24, 28, 24)
-        lay.setSpacing(16)
+        lay.setSpacing(14)
 
         titulo = QLabel("Limpa PDF")
         f = QFont(); f.setPointSize(20); f.setBold(True)
@@ -276,21 +299,18 @@ class JanelaPrincipal(QWidget):
 
         lay.addWidget(self._linha())
 
-        # --- seleção de entrada ---
-        sel = QHBoxLayout()
-        self.btn_pasta = QPushButton("Selecionar pasta")
-        self.btn_pdf = QPushButton("Selecionar PDF")
-        self.btn_pasta.clicked.connect(self._escolher_pasta)
-        self.btn_pdf.clicked.connect(self._escolher_pdf)
-        sel.addWidget(self.btn_pasta)
-        sel.addWidget(self.btn_pdf)
-        lay.addLayout(sel)
+        self.area_drop = AreaDrop()
+        self.area_drop.entrada_definida.connect(self._on_entrada_definida)
+        lay.addWidget(self.area_drop)
 
-        self.lbl_entrada = QLabel("Nenhuma seleção  ·  (você também pode arrastar para esta janela)")
+        self.lbl_entrada = QLabel(
+            "Nenhuma seleção  ·  (você também pode arrastar para a área acima)"
+        )
         self.lbl_entrada.setStyleSheet("color: #777; font-style: italic;")
         lay.addWidget(self.lbl_entrada)
 
-        # --- opções (só habilitam após selecionar) ---
+        lay.addWidget(self._linha())
+
         self.box_opcoes = QFrame()
         op = QVBoxLayout(self.box_opcoes)
         op.setSpacing(8)
@@ -298,7 +318,7 @@ class JanelaPrincipal(QWidget):
         self.chk_ocr = QCheckBox("Reconhecer texto de páginas escaneadas (OCR) — mais lento")
         self.chk_pag = QCheckBox("Numerar as páginas (recomendado para citar páginas à IA)")
         self.chk_txt = QCheckBox("Gerar arquivo de texto (.txt) para colar na IA")
-        self.chk_pag.setChecked(True)            # padrões (CLAUDE.md §8)
+        self.chk_pag.setChecked(True)
         self.chk_txt.setChecked(True)
 
         div = QHBoxLayout()
@@ -306,7 +326,7 @@ class JanelaPrincipal(QWidget):
         self.chk_div.setChecked(True)
         self.spin_pag = QSpinBox()
         self.spin_pag.setRange(1, 9999)
-        self.spin_pag.setValue(core.MAX_PAGINAS)   # padrão 150, vindo do núcleo
+        self.spin_pag.setValue(core.MAX_PAGINAS)
         self.spin_pag.setSuffix(" páginas")
         self.chk_div.toggled.connect(self.spin_pag.setEnabled)
         div.addWidget(self.chk_div)
@@ -317,106 +337,142 @@ class JanelaPrincipal(QWidget):
         op.addWidget(self.chk_pag)
         op.addLayout(div)
         op.addWidget(self.chk_txt)
-        self.box_opcoes.setEnabled(False)        # desabilitado até haver entrada
+        self.box_opcoes.setEnabled(False)
         lay.addWidget(self.box_opcoes)
 
-        # --- ação ---
         self.btn_limpar = QPushButton("Limpar")
         self.btn_limpar.setMinimumHeight(40)
         self.btn_limpar.setEnabled(False)
-        self.btn_limpar.clicked.connect(self._iniciar)
+        self.btn_limpar.setStyleSheet(ESTILO_BTN_LIMPAR)
+        self.btn_limpar.clicked.connect(self._on_btn_limpar)
         lay.addWidget(self.btn_limpar)
 
-        # --- progresso ---
         self.barra = QProgressBar()
         self.barra.setValue(0)
         self.barra.hide()
+        lay.addWidget(self.barra)
+
         self.lbl_status = QLabel("")
         self.lbl_status.setStyleSheet("color: #555;")
-        lay.addWidget(self.barra)
         lay.addWidget(self.lbl_status)
+
+        self.log_area = QPlainTextEdit()
+        self.log_area.setObjectName("log_area")
+        self.log_area.setReadOnly(True)
+        self.log_area.setFixedHeight(140)
+        self.log_area.hide()
+        lay.addWidget(self.log_area)
+
+        self.btn_abrir = QPushButton("Abrir pasta LIMPOS")
+        self.btn_abrir.clicked.connect(self._abrir_pasta)
+        self.btn_abrir.hide()
+        lay.addWidget(self.btn_abrir)
 
         lay.addStretch()
 
     def _linha(self) -> QFrame:
-        ln = QFrame(); ln.setFrameShape(QFrame.HLine)
+        ln = QFrame()
+        ln.setFrameShape(QFrame.HLine)
         ln.setStyleSheet("color: #ddd;")
         return ln
 
-    # ---- seleção ---------------------------------------------------------- #
-    def _escolher_pasta(self):
-        d = QFileDialog.getExistingDirectory(self, "Escolha a pasta com os PDFs")
-        if d:
-            self._definir_entrada(Path(d))
-
-    def _escolher_pdf(self):
-        f, _ = QFileDialog.getOpenFileName(self, "Escolha um PDF", filter="PDF (*.pdf)")
-        if f:
-            self._definir_entrada(Path(f))
-
-    def _definir_entrada(self, p: Path):
-        self.entrada = p
-        tipo = "Pasta" if p.is_dir() else "Arquivo"
-        self.lbl_entrada.setText(f"{tipo} selecionado:  {p}")
+    # ── seleção de entrada ─────────────────────────────────────────────────── #
+    def _on_entrada_definida(self, paths: list):
+        self.entradas = [p if isinstance(p, Path) else Path(p) for p in paths]
+        if len(self.entradas) == 1:
+            p = self.entradas[0]
+            tipo = "Pasta" if p.is_dir() else "PDF"
+            self.lbl_entrada.setText(f"{tipo} selecionado: {p}")
+        else:
+            self.lbl_entrada.setText(f"{len(self.entradas)} PDFs selecionados")
         self.lbl_entrada.setStyleSheet("color: #222;")
         self.box_opcoes.setEnabled(True)
         self.btn_limpar.setEnabled(True)
 
-    # ---- drag-and-drop ---------------------------------------------------- #
-    def dragEnterEvent(self, e):
-        if e.mimeData().hasUrls():
-            e.acceptProposedAction()
+    # ── execução ───────────────────────────────────────────────────────────── #
+    def _on_btn_limpar(self):
+        if self._processando:
+            self._cancelar_worker()
+        else:
+            self._iniciar()
 
-    def dropEvent(self, e):
-        urls = e.mimeData().urls()
-        if not urls:
-            return
-        p = Path(urls[0].toLocalFile())          # TODO: aceitar múltiplos itens
-        if p.is_dir() or p.suffix.lower() == ".pdf":
-            self._definir_entrada(p)
-
-    # ---- execução --------------------------------------------------------- #
     def _iniciar(self):
-        if not self.entrada:
+        if not self.entradas:
             return
         opcoes = {
-            "ocr": self.chk_ocr.isChecked(),
-            "paginar": self.chk_pag.isChecked(),
-            "dividir": self.chk_div.isChecked(),
-            "max_pag": self.spin_pag.value(),
-            "txt": self.chk_txt.isChecked(),
-            "sem_cabecalho": True,               # sempre ligado no fluxo atual (§8)
+            "ocr":           self.chk_ocr.isChecked(),
+            "paginar":       self.chk_pag.isChecked(),
+            "dividir":       self.chk_div.isChecked(),
+            "max_pag":       self.spin_pag.value(),
+            "txt":           self.chk_txt.isChecked(),
+            "sem_cabecalho": True,
         }
-        self._travar_ui(True)
-        self.barra.show(); self.barra.setValue(0)
+        self._processando = True
+        self._pasta_saida = None
+        self.btn_limpar.setText("Cancelar")
+        self.btn_limpar.setStyleSheet(ESTILO_BTN_CANCELAR)
+        self.area_drop.setEnabled(False)
+        self.box_opcoes.setEnabled(False)
+        self.barra.show()
+        self.barra.setValue(0)
+        self.lbl_status.setText("")
+        self.log_area.clear()
+        self.log_area.show()
+        self.btn_abrir.hide()
 
-        self.worker = Worker([self.entrada], opcoes)
+        self.worker = Worker(self.entradas, opcoes)
         self.worker.progresso.connect(self._on_progresso)
+        self.worker.log.connect(self._on_log)
         self.worker.terminou.connect(self._on_terminou)
         self.worker.erro.connect(self._on_erro)
         self.worker.start()
 
+    def _cancelar_worker(self):
+        if self.worker:
+            self.worker.requisitar_cancelamento()
+        self.btn_limpar.setEnabled(False)
+        self.lbl_status.setText("Cancelando... aguarde o arquivo atual terminar.")
+
+    # ── slots de sinal ─────────────────────────────────────────────────────── #
     def _on_progresso(self, pct: int, texto: str):
         self.barra.setValue(pct)
         self.lbl_status.setText(texto)
 
+    def _on_log(self, linha: str):
+        self.log_area.appendPlainText(linha)
+
     def _on_terminou(self, gerados: list, cancelado: bool):
-        self._travar_ui(False)
+        self._restaurar_ui()
+        n = len(gerados)
         if cancelado:
             self.lbl_status.setText(
-                f"Cancelado. {len(gerados)} arquivo(s) gerado(s) antes do cancelamento."
+                f"Cancelado. {n} arquivo(s) gerado(s) antes do cancelamento."
             )
         else:
-            self.lbl_status.setText(f"Concluído. {len(gerados)} arquivo(s) gerado(s).")
-        # TODO: botão "Abrir pasta de saída" (QDesktopServices.openUrl).
+            self.lbl_status.setText(f"Concluído. {n} arquivo(s) gerado(s).")
+            if self.entradas:
+                primeiro = self.entradas[0]
+                pasta = (primeiro if primeiro.is_dir() else primeiro.parent) / "LIMPOS"
+                if pasta.is_dir():
+                    self._pasta_saida = pasta
+                    self.btn_abrir.show()
 
     def _on_erro(self, msg: str):
-        self._travar_ui(False)
-        self.lbl_status.setText(f"Erro: {msg}")
+        self._restaurar_ui()
+        QMessageBox.critical(self, "Erro", msg)
+        self.lbl_status.setText("Erro. Verifique os arquivos e tente novamente.")
 
-    def _travar_ui(self, travado: bool):
-        for w in (self.btn_pasta, self.btn_pdf, self.btn_limpar, self.box_opcoes):
-            w.setEnabled(not travado)
+    def _restaurar_ui(self):
+        self._processando = False
+        self.area_drop.setEnabled(True)
+        self.box_opcoes.setEnabled(bool(self.entradas))
+        self.btn_limpar.setEnabled(True)
+        self.btn_limpar.setText("Limpar")
+        self.btn_limpar.setStyleSheet(ESTILO_BTN_LIMPAR)
+
+    def _abrir_pasta(self):
+        if self._pasta_saida and self._pasta_saida.is_dir():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._pasta_saida)))
 
 
 def main():
