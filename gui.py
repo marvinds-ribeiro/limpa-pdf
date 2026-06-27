@@ -39,6 +39,27 @@ from PySide6.QtWidgets import (
 import limpa_pdf_mpsc as core
 
 
+# ── 1. CONSTANTES E ESTILOS ──────────────────────────────────────────────── #
+
+
+def _coletar_arquivos(entradas: list[Path]) -> list[tuple[Path, Path]]:
+    """Expande pastas recursivamente; retorna (arquivo, pasta_saida) sem duplicatas."""
+    vistos: set[Path] = set()
+    resultado: list[tuple[Path, Path]] = []
+    for entrada in entradas:
+        if entrada.is_dir():
+            base = entrada / "LIMPOS"
+            candidatos = sorted(entrada.rglob("*.pdf"))
+        else:
+            base = entrada.parent / "LIMPOS"
+            candidatos = [entrada]
+        for arq in candidatos:
+            if "_limpo" not in arq.stem and arq not in vistos:
+                vistos.add(arq)
+                resultado.append((arq, base))
+    return resultado
+
+
 # --------------------------------------------------------------------------- #
 #  Worker: roda o pipeline numa thread separada para não travar a janela.
 # --------------------------------------------------------------------------- #
