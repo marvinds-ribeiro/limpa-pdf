@@ -173,6 +173,69 @@ class Worker(QThread):
         self.terminou.emit(gerados, cancelado)
 
 
+# ── 3. WIDGETS AUXILIARES ─────────────────────────────────────────────────── #
+
+
+class AreaDrop(QFrame):
+    """Zona de seleção e drag-and-drop; emite entrada_definida(list[Path])."""
+
+    entrada_definida = Signal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setStyleSheet(
+            "QFrame { border: 1px dashed #bbb; border-radius: 6px; }"
+        )
+        self._montar()
+
+    def _montar(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setSpacing(8)
+
+        botoes = QHBoxLayout()
+        btn_pasta = QPushButton("Selecionar pasta")
+        btn_pdfs  = QPushButton("Selecionar PDF(s)")
+        btn_pasta.clicked.connect(self._escolher_pasta)
+        btn_pdfs.clicked.connect(self._escolher_pdfs)
+        botoes.addWidget(btn_pasta)
+        botoes.addWidget(btn_pdfs)
+        lay.addLayout(botoes)
+
+        hint = QLabel("ou arraste pastas e PDFs aqui")
+        hint.setAlignment(Qt.AlignCenter)
+        hint.setStyleSheet("color: #999; font-style: italic; border: none;")
+        lay.addWidget(hint)
+
+    def _escolher_pasta(self):
+        d = QFileDialog.getExistingDirectory(self, "Escolha a pasta com os PDFs")
+        if d:
+            self.entrada_definida.emit([Path(d)])
+
+    def _escolher_pdfs(self):
+        fs, _ = QFileDialog.getOpenFileNames(
+            self, "Escolha PDF(s)", filter="PDF (*.pdf)"
+        )
+        if fs:
+            self.entrada_definida.emit([Path(f) for f in fs])
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        paths = [
+            Path(url.toLocalFile())
+            for url in e.mimeData().urls()
+            if Path(url.toLocalFile()).is_dir()
+            or Path(url.toLocalFile()).suffix.lower() == ".pdf"
+        ]
+        if paths:
+            self.entrada_definida.emit(paths)
+
+
 # --------------------------------------------------------------------------- #
 #  Janela principal.
 # --------------------------------------------------------------------------- #
