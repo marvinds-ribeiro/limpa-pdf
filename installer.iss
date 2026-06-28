@@ -9,6 +9,7 @@ AppPublisher=MPSC
 AppPublisherURL=
 AppSupportURL=
 AppUpdatesURL=
+AppId={{A3F2E1D0-8B7C-4F5A-9E6D-2C1B0A3F4E5D}
 DefaultDirName={commonpf64}\LimpaPDF
 DefaultGroupName=Limpa PDF
 AllowNoIcons=yes

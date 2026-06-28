@@ -72,7 +72,7 @@ if hasattr(sys, "_MEIPASS"):
     _tess = Path(sys._MEIPASS) / "tesseract"
     import pytesseract
     pytesseract.pytesseract.tesseract_cmd = str(_tess / "tesseract.exe")
-    os.environ["TESSDATA_PREFIX"] = str(_tess / "tessdata")
+    os.environ["TESSDATA_PREFIX"] = str(_tess)  # Tesseract acrescenta /tessdata/ internamente
 ```
 
 Isso garante que `_preparar_ocr()` do core encontre o Tesseract bundled sem nenhuma modificação no módulo core.

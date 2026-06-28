@@ -29,7 +29,6 @@ Write-Step "Verificando pre-requisitos"
 if (-not (Get-Command python -ErrorAction SilentlyContinue)) { Fail "python nao encontrado no PATH" }
 if (-not (Get-Command pip    -ErrorAction SilentlyContinue)) { Fail "pip nao encontrado no PATH" }
 if (-not (Test-Path $TESSERACT_DIR)) { Fail "Tesseract nao encontrado em $TESSERACT_DIR" }
-if (-not (Test-Path $ISCC))          { Fail "Inno Setup nao encontrado em $ISCC -- instale via: winget install JRSoftware.InnoSetup" }
 if (-not (Test-Path "icone.png"))    { Fail "icone.png nao encontrado na pasta do projeto" }
 if (-not (Test-Path "limpa_pdf.spec")) { Fail "limpa_pdf.spec nao encontrado" }
 if (-not (Test-Path "installer.iss"))  { Fail "installer.iss nao encontrado" }
@@ -89,6 +88,14 @@ if (-not (Test-Path "dist\LimpaPDF\LimpaPDF.exe")) {
     Fail "dist\LimpaPDF\LimpaPDF.exe nao foi gerado -- verifique o log do PyInstaller acima"
 }
 Write-Host "  LimpaPDF.exe gerado" -ForegroundColor Green
+
+if (-not (Test-Path "dist\LimpaPDF\_internal\tesseract\tesseract.exe")) {
+    Fail "Tesseract nao foi incluido no bundle -- verifique o caminho em limpa_pdf.spec"
+}
+
+if (-not (Test-Path "dist\LimpaPDF\_internal\tesseract\tessdata\por.traineddata")) {
+    Fail "por.traineddata nao foi incluido no bundle -- verifique assets\tessdata_best\"
+}
 
 # 5. Inno Setup build
 Write-Step "Build Inno Setup (LimpaPDF_setup.exe)"
