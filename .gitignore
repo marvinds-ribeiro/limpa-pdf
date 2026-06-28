@@ -3,3 +3,8 @@ __pycache__/
 .superpowers/
 .pytest_cache/
 .claude/
+assets/
+icone.ico
+dist/
+build/
+*.spec.bak
