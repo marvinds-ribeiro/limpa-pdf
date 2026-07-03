@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-limpa_pdf_mpsc.py — v2.6 — Limpeza em lote de PDFs exportados do SIG (Softplan/MPSC)
+limpa_pdf_mpsc.py — v2.7 — Limpeza em lote de PDFs exportados do SIG (Softplan/MPSC)
 
 Remove, em qualquer layout (GAECO, CAT, Promotorias...):
   1. Assinatura digital vertical da margem (texto rotacionado OU vetorizado) — sempre
@@ -14,6 +14,21 @@ Extras:
   --ocr  Usa OCR (Tesseract) nas páginas sem texto aproveitável (corpo
          vetorizado/escaneado OU camada de texto corrompida), para que o
          .txt não perca informação
+
+Novidades da v2.7:
+  - PROTEÇÃO DO CORPO ESCANEADO FATIADO EM TIRAS: scans do SIG frequentemente
+    vêm desenhados como 2-3 tiras horizontais de imagem (cada uma com ~100%
+    da largura, mas 33-47% da altura). A proteção antiga de "imagem de página
+    inteira" exigia >= 80% da largura E da altura POR IMAGEM, então nenhuma
+    tira passava e os cortes de cabeçalho/rodapé apagavam o corpo inteiro do
+    documento (página em branco -> OCR de lixo). Agora, se a união vertical
+    das imagens largas cobre >= 80% da página, elas são o corpo escaneado e
+    nunca são removidas (vide _tiras_corpo).
+  - TESSDATA_BEST EMBUTIDO COM PRIORIDADE: o OCR passa a preferir o modelo
+    por.traineddata do tessdata_best que acompanha o programa (assets/ no
+    desenvolvimento, bundle do PyInstaller no app congelado) em vez do modelo
+    FAST (quantizado) da instalação comum do Tesseract — apontado via
+    TESSDATA_PREFIX, imune a caminhos com espaços (vide _tessdata_embutido).
 
 Novidades da v2.6:
   - OCR FORÇADO EM CAMADA DE TEXTO CORROMPIDA: alguns PDFs do SIG trazem uma
@@ -516,6 +531,40 @@ def analisar(pdf):
     return boiler, boiler_base_P, cortes, faixas_base
 
 
+def _tiras_corpo(els, W, H):
+    """Índices das imagens que formam o CORPO ESCANEADO fatiado em tiras.
+
+    Scans do SIG frequentemente vêm desenhados como 2-3 TIRAS horizontais de
+    imagem: cada uma cobre ~100% da largura, mas só 33-47% da altura — abaixo
+    de IMG_PAGINA_FRAC, então a proteção de "imagem de página inteira" (que
+    exige >= 80% da largura E da altura POR IMAGEM) não as alcança, e os
+    cortes de topo/base apagariam o documento inteiro (página em branco ->
+    OCR de lixo). Regra: se a UNIÃO dos intervalos verticais das imagens
+    LARGAS (>= IMG_PAGINA_FRAC da largura) cobre >= IMG_PAGINA_FRAC da altura
+    da página, essas imagens são o corpo escaneado e NUNCA são removidas
+    (preservação conservadora, CLAUDE.md §5). Banners/logos decorativos rasos
+    não são afetados: a união deles fica muito abaixo do limiar."""
+    tiras = [(i, bbox) for i, (kind, _key, bbox, _instrs, rot) in enumerate(els)
+             if kind in ("I", "II") and bbox and not rot
+             and (bbox[2] - bbox[0]) >= W * IMG_PAGINA_FRAC]
+    if not tiras:
+        return set()
+    cobertura = 0.0
+    lo = hi = None
+    for y0, y1 in sorted((b[1], b[3]) for _i, b in tiras):
+        if lo is None:
+            lo, hi = y0, y1
+        elif y0 <= hi + 2:          # tiras emendadas (tolerância de 2 pt)
+            hi = max(hi, y1)
+        else:
+            cobertura += hi - lo
+            lo, hi = y0, y1
+    cobertura += hi - lo
+    if cobertura >= H * IMG_PAGINA_FRAC:
+        return {i for i, _b in tiras}
+    return set()
+
+
 def reescrever(pdf, page, idx, boiler, boiler_base_P, cortes, faixas_base, sem_cabecalho):
     g = _grupo(page)
     W, H = g
@@ -523,6 +572,9 @@ def reescrever(pdf, page, idx, boiler, boiler_base_P, cortes, faixas_base, sem_c
     els = _elementos(page)
     if els is None:
         return False
+
+    # Corpo escaneado fatiado em tiras: protegido ANTES de qualquer corte.
+    tiras_corpo = _tiras_corpo(els, W, H)
 
     drop_ix = set()
     spans_rem = []
@@ -573,7 +625,10 @@ def reescrever(pdf, page, idx, boiler, boiler_base_P, cortes, faixas_base, sem_c
                 kind in ("I", "II") and bbox
                 and (bbox[2] - bbox[0]) >= W * IMG_PAGINA_FRAC
                 and (bbox[3] - bbox[1]) >= H * IMG_PAGINA_FRAC)
-            if img_pagina_inteira:
+            # Também protege o corpo escaneado FATIADO em tiras (vide
+            # _tiras_corpo): nenhuma tira passa no teste acima sozinha, mas
+            # juntas elas são a própria página.
+            if img_pagina_inteira or i in tiras_corpo:
                 drop = False  # protege o corpo escaneado
             elif bbox and tracado and bbox[2] <= CANTO_X and bbox[1] >= H - CANTO_Y:
                 drop = True  # moldura do carimbo CÓPIA (contorno tracejado)
@@ -600,6 +655,32 @@ def reescrever(pdf, page, idx, boiler, boiler_base_P, cortes, faixas_base, sem_c
 
 
 # ----------------------------- TXT / OCR ------------------------------------
+
+def _tessdata_embutido():
+    """Pasta de tessdata EMBUTIDA no aplicativo, se existir (ou None).
+
+    É o por.traineddata do tessdata_BEST que acompanha o programa:
+      - app congelado (PyInstaller): <sys._MEIPASS>/tesseract/tessdata;
+      - ambiente de desenvolvimento: <pasta do script>/assets/tessdata_best.
+    Tem PRIORIDADE sobre qualquer instalação do sistema: o instalador típico
+    do Tesseract traz o modelo FAST (quantizado, ~2 MB), de precisão menor;
+    o embutido garante o stack de melhor qualidade (tessdata_best, CLAUDE.md
+    §4) e a operação 100% offline."""
+    bases = []
+    if hasattr(sys, "_MEIPASS"):
+        bases.append(Path(sys._MEIPASS) / "tesseract" / "tessdata")
+    try:
+        bases.append(Path(__file__).resolve().parent / "assets" / "tessdata_best")
+    except Exception:
+        pass
+    for b in bases:
+        try:
+            if (b / "por.traineddata").is_file():
+                return b
+        except Exception:
+            continue
+    return None
+
 
 def _localizar_tessdata_por():
     """Procura um 'por.traineddata' ja existente no PC (sem baixar nada).
@@ -678,6 +759,8 @@ def _preparar_ocr():
     """Localiza o Tesseract (mesmo fora do PATH) e garante o idioma portugues.
 
     Ordem de prioridade:
+      0. tessdata_best EMBUTIDO no aplicativo (bundle congelado ou assets/)
+         -> melhor qualidade e 100% offline;
       1. portugues ja visivel para o Tesseract (config padrao);
       2. 'por.traineddata' encontrado em alguma pasta conhecida do PC
          (inclui pastas avulsas como a do IPED) -> usa --tessdata-dir, SEM
@@ -708,6 +791,19 @@ def _preparar_ocr():
         print("   [aviso] Programa Tesseract nao encontrado. Instale-o (veja o"
               " LEIA-ME) ou rode sem --ocr.")
         return None, None
+
+    # (0) tessdata embutido no aplicativo (modelo BEST): prioridade maxima.
+    # A instalacao comum do Tesseract traz o modelo FAST; se o programa
+    # carrega o proprio tessdata_best, e ELE que garante a qualidade do OCR.
+    # Apontado via TESSDATA_PREFIX, e nao '--tessdata-dir "..."': o pytesseract
+    # divide o config com shlex NAO-posix no Windows, e as aspas de um caminho
+    # com espacos (ex.: "Limpa PDF - Code") chegariam literais ao Tesseract.
+    pasta_best = _tessdata_embutido()
+    if pasta_best is not None:
+        os.environ["TESSDATA_PREFIX"] = str(pasta_best)
+        print(f"   OCR: usando o modelo portugues embutido (tessdata_best)"
+              f" em {pasta_best}")
+        return "por", ""
 
     # (1) portugues ja disponivel na configuracao padrao do Tesseract?
     try:
