@@ -27,13 +27,10 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-import os
 
-if hasattr(sys, "_MEIPASS"):
-    _tess = Path(sys._MEIPASS) / "tesseract"
-    import pytesseract
-    pytesseract.pytesseract.tesseract_cmd = str(_tess / "tesseract.exe")
-    os.environ["TESSDATA_PREFIX"] = str(_tess)
+# No app congelado (PyInstaller), a resolução do Tesseract embutido
+# (exe + tessdata_best) é responsabilidade do core: _preparar_ocr() detecta
+# sys._MEIPASS e configura tudo (vide limpa_pdf_mpsc._tessdata_embutido).
 
 from PySide6.QtCore import Qt, QThread, Signal, QUrl
 from PySide6.QtGui import QFont, QDesktopServices

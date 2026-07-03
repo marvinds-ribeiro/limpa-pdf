@@ -776,7 +776,18 @@ def _preparar_ocr():
         print(f"   [aviso] OCR indisponivel (pytesseract: {e}).")
         return None, None
 
-    exe = shutil.which("tesseract")
+    exe = None
+    # Tesseract EMBUTIDO no bundle congelado (PyInstaller): prioridade sobre
+    # o PATH e as instalacoes do sistema. E o que garante OCR em maquinas SEM
+    # Tesseract instalado (operacao 100% offline) e evita que um exe do
+    # sistema, de versao/idiomas diferentes, sobrescreva o do pacote.
+    if hasattr(sys, "_MEIPASS"):
+        cand = Path(sys._MEIPASS) / "tesseract" / "tesseract.exe"
+        if cand.is_file():
+            exe = str(cand)
+            pytesseract.pytesseract.tesseract_cmd = exe
+    if not exe:
+        exe = shutil.which("tesseract")
     if not exe and os.name == "nt":
         candidatos = [
             os.path.expandvars(r"%ProgramFiles%\Tesseract-OCR\tesseract.exe"),
