@@ -8,3 +8,14 @@ icone.ico
 dist/
 build/
 *.spec.bak
+
+# Documentos e saídas de teste — nunca versionar (podem conter dados de procedimentos)
+*.pdf
+*.txt
+!LEIA-ME.txt
+LIMPOS/
+exemplos/
+prints/
+
+# Imagens de identidade visual (binários grandes, fora do escopo do código)
+*.png
