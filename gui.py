@@ -43,7 +43,159 @@ from PySide6.QtWidgets import (
 import limpa_pdf_mpsc as core
 
 
-# ── 1. CONSTANTES E ESTILOS ──────────────────────────────────────────────── #
+# ── 1. TEMA INSTITUCIONAL (explícito — NUNCA herda a paleta do sistema) ───── #
+#
+# O app roda em máquinas gerenciadas com Windows em modo claro OU escuro. Sem
+# tema explícito, o Qt herda a paleta do sistema e o resultado quebra (ver
+# prints/: checkboxes e barra vermelhos, texto branco do sistema sobre fundo
+# claro fixo). Aqui TODAS as cores são fixadas — QPalette + QSS central — de
+# modo que a janela seja idêntica nos dois modos do Windows.
+#
+# Paleta sóbria (ferramenta institucional do MPSC): fundos neutros claros,
+# texto quase-preto, UM tom de destaque (azul institucional) para a ação
+# principal; vermelho APENAS na ação destrutiva (cancelar processamento).
+# Todos os pares texto/fundo abaixo atendem WCAG AA (>= 4.5:1) — verificado
+# em tests/test_tema.py.
+
+COR_FUNDO          = "#f4f5f7"  # fundo geral da janela
+COR_SUPERFICIE     = "#ffffff"  # campos, log, área de seleção
+COR_TEXTO          = "#1a1f24"  # texto principal (quase-preto)
+COR_TEXTO_SUAVE    = "#5a626c"  # explicações e dicas
+COR_BORDA          = "#c3c9d0"  # bordas de campos e separadores
+COR_DESTAQUE       = "#003366"  # azul institucional — botão "Limpar"
+COR_DESTAQUE_HOVER = "#004488"
+COR_PERIGO         = "#8b0000"  # vermelho — SÓ p/ ação destrutiva (cancelar)
+COR_PERIGO_HOVER   = "#a00000"
+COR_BOTAO          = "#e8ebef"  # botões neutros (selecionar, abrir pasta)
+COR_BOTAO_HOVER    = "#dde1e6"
+COR_DESAB_FUNDO    = "#c9cdd2"  # controles desabilitados
+COR_DESAB_TEXTO    = "#5d646b"
+COR_BARRA_FUNDO    = "#e2e6ea"  # trilho da barra de progresso
+# O preenchimento é um tom CLARO do azul institucional de propósito: o texto
+# do percentual (preto) fica legível tanto sobre o trilho quanto sobre o
+# preenchimento, em qualquer fração de progresso (AA nos dois fundos).
+COR_BARRA_CHUNK    = "#a9c3dd"
+
+TEMA_QSS = f"""
+QWidget {{
+    background-color: {COR_FUNDO};
+    color: {COR_TEXTO};
+}}
+QLabel {{ background: transparent; }}
+QLabel#explicacao {{ color: {COR_TEXTO_SUAVE}; }}
+QLabel#hint_drop {{ color: {COR_TEXTO_SUAVE}; font-style: italic; border: none; }}
+QLabel#lbl_entrada {{ color: {COR_TEXTO_SUAVE}; font-style: italic; }}
+QLabel#lbl_entrada[definida="true"] {{ color: {COR_TEXTO}; font-style: normal; }}
+QLabel#lbl_status {{ color: {COR_TEXTO}; background-color: {COR_FUNDO}; }}
+
+QPushButton {{
+    background-color: {COR_BOTAO};
+    color: {COR_TEXTO};
+    border: 1px solid {COR_BORDA};
+    border-radius: 4px;
+    padding: 6px 16px;
+}}
+QPushButton:hover {{ background-color: {COR_BOTAO_HOVER}; }}
+QPushButton:disabled {{
+    background-color: {COR_DESAB_FUNDO};
+    color: {COR_DESAB_TEXTO};
+    border-color: {COR_DESAB_FUNDO};
+}}
+
+QPushButton#btn_limpar {{
+    background-color: {COR_DESTAQUE};
+    color: #ffffff;
+    border: none;
+    font-size: 13px;
+}}
+QPushButton#btn_limpar:hover {{ background-color: {COR_DESTAQUE_HOVER}; }}
+QPushButton#btn_limpar[modo="perigo"] {{ background-color: {COR_PERIGO}; }}
+QPushButton#btn_limpar[modo="perigo"]:hover {{ background-color: {COR_PERIGO_HOVER}; }}
+QPushButton#btn_limpar:disabled {{
+    background-color: {COR_DESAB_FUNDO};
+    color: {COR_DESAB_TEXTO};
+}}
+
+QCheckBox {{ background: transparent; color: {COR_TEXTO}; }}
+QSpinBox {{
+    background-color: {COR_SUPERFICIE};
+    color: {COR_TEXTO};
+    border: 1px solid {COR_BORDA};
+    border-radius: 3px;
+    padding: 2px 6px;
+}}
+QSpinBox:disabled {{ background-color: {COR_DESAB_FUNDO}; color: {COR_DESAB_TEXTO}; }}
+
+QProgressBar {{
+    background-color: {COR_BARRA_FUNDO};
+    color: {COR_TEXTO};
+    border: 1px solid {COR_BORDA};
+    border-radius: 4px;
+    text-align: center;
+    min-height: 22px;
+}}
+QProgressBar::chunk {{
+    background-color: {COR_BARRA_CHUNK};
+    border-radius: 3px;
+}}
+
+QPlainTextEdit#log_area {{
+    background-color: {COR_SUPERFICIE};
+    color: {COR_TEXTO};
+    border: 1px solid {COR_BORDA};
+    font-family: Consolas, 'Courier New', monospace;
+    font-size: 9pt;
+}}
+
+QFrame#area_drop {{
+    background-color: {COR_SUPERFICIE};
+    border: 1px dashed {COR_BORDA};
+    border-radius: 6px;
+}}
+QFrame#linha {{ color: {COR_BORDA}; }}
+
+QToolTip {{
+    background-color: {COR_SUPERFICIE};
+    color: {COR_TEXTO};
+    border: 1px solid {COR_BORDA};
+}}
+"""
+
+
+def aplicar_tema(app: QApplication) -> None:
+    """Aplica o tema claro institucional, EXPLÍCITO e completo: estilo Fusion
+    (desenha com a QPalette, sem tema nativo do Windows), QPalette com todos
+    os papéis fixados e a folha de estilo central TEMA_QSS. Com isso o visual
+    é idêntico com o Windows em modo claro ou escuro — inclusive o indicador
+    dos checkboxes (Highlight = azul institucional, nunca a cor do sistema)."""
+    from PySide6.QtGui import QColor, QPalette
+
+    app.setStyle("Fusion")
+    pal = QPalette()
+    pal.setColor(QPalette.Window, QColor(COR_FUNDO))
+    pal.setColor(QPalette.WindowText, QColor(COR_TEXTO))
+    pal.setColor(QPalette.Base, QColor(COR_SUPERFICIE))
+    pal.setColor(QPalette.AlternateBase, QColor(COR_BARRA_FUNDO))
+    pal.setColor(QPalette.Text, QColor(COR_TEXTO))
+    pal.setColor(QPalette.PlaceholderText, QColor(COR_TEXTO_SUAVE))
+    pal.setColor(QPalette.Button, QColor(COR_BOTAO))
+    pal.setColor(QPalette.ButtonText, QColor(COR_TEXTO))
+    pal.setColor(QPalette.BrightText, QColor("#ffffff"))
+    pal.setColor(QPalette.Highlight, QColor(COR_DESTAQUE))
+    pal.setColor(QPalette.HighlightedText, QColor("#ffffff"))
+    pal.setColor(QPalette.Link, QColor(COR_DESTAQUE))
+    pal.setColor(QPalette.ToolTipBase, QColor(COR_SUPERFICIE))
+    pal.setColor(QPalette.ToolTipText, QColor(COR_TEXTO))
+    for papel in (QPalette.WindowText, QPalette.Text, QPalette.ButtonText):
+        pal.setColor(QPalette.Disabled, papel, QColor(COR_DESAB_TEXTO))
+    app.setPalette(pal)
+    app.setStyleSheet(TEMA_QSS)
+
+
+def _repolir(w) -> None:
+    """Reaplica o QSS após mudança de propriedade dinâmica (ex.: [modo])."""
+    w.style().unpolish(w)
+    w.style().polish(w)
 
 
 def _coletar_arquivos(entradas: list[Path]) -> list[tuple[Path, Path]]:
@@ -62,28 +214,6 @@ def _coletar_arquivos(entradas: list[Path]) -> list[tuple[Path, Path]]:
                 vistos.add(arq)
                 resultado.append((arq, base))
     return resultado
-
-
-ESTILO_BTN_LIMPAR = (
-    "QPushButton { background-color: #003366; color: white; border-radius: 4px;"
-    " padding: 6px 16px; font-size: 13px; }"
-    "QPushButton:hover { background-color: #004488; }"
-    "QPushButton:disabled { background-color: #aaa; color: #eee; }"
-)
-ESTILO_BTN_CANCELAR = (
-    "QPushButton { background-color: #8b0000; color: white; border-radius: 4px;"
-    " padding: 6px 16px; font-size: 13px; }"
-    "QPushButton:hover { background-color: #a00000; }"
-    "QPushButton:disabled { background-color: #aaa; color: #eee; }"
-)
-APP_STYLESHEET = (
-    "QPlainTextEdit#log_area {"
-    "  background-color: #f5f5f5;"
-    "  border: 1px solid #ddd;"
-    "  font-family: Consolas, 'Courier New', monospace;"
-    "  font-size: 9pt;"
-    "}"
-)
 
 
 # ── 2. WORKER ─────────────────────────────────────────────────────────────── #
@@ -211,9 +341,7 @@ class AreaDrop(QFrame):
         super().__init__(parent)
         self.setAcceptDrops(True)
         self.setFrameShape(QFrame.StyledPanel)
-        self.setStyleSheet(
-            "QFrame { border: 1px dashed #bbb; border-radius: 6px; }"
-        )
+        self.setObjectName("area_drop")   # estilizado no TEMA_QSS central
         self._montar()
 
     def _montar(self):
@@ -232,7 +360,7 @@ class AreaDrop(QFrame):
 
         hint = QLabel("ou arraste pastas e PDFs aqui")
         hint.setAlignment(Qt.AlignCenter)
-        hint.setStyleSheet("color: #999; font-style: italic; border: none;")
+        hint.setObjectName("hint_drop")   # estilizado no TEMA_QSS central
         lay.addWidget(hint)
 
     def _escolher_pasta(self):
@@ -298,7 +426,7 @@ class JanelaPrincipal(QWidget):
 
         expl = QLabel(EXPLICACAO)
         expl.setWordWrap(True)
-        expl.setStyleSheet("color: #555;")
+        expl.setObjectName("explicacao")
         lay.addWidget(expl)
 
         lay.addWidget(self._linha())
@@ -310,7 +438,8 @@ class JanelaPrincipal(QWidget):
         self.lbl_entrada = QLabel(
             "Nenhuma seleção  ·  (você também pode arrastar para a área acima)"
         )
-        self.lbl_entrada.setStyleSheet("color: #777; font-style: italic;")
+        self.lbl_entrada.setObjectName("lbl_entrada")
+        self.lbl_entrada.setProperty("definida", "false")
         lay.addWidget(self.lbl_entrada)
 
         lay.addWidget(self._linha())
@@ -345,9 +474,9 @@ class JanelaPrincipal(QWidget):
         lay.addWidget(self.box_opcoes)
 
         self.btn_limpar = QPushButton("Limpar")
+        self.btn_limpar.setObjectName("btn_limpar")
         self.btn_limpar.setMinimumHeight(40)
         self.btn_limpar.setEnabled(False)
-        self.btn_limpar.setStyleSheet(ESTILO_BTN_LIMPAR)
         self.btn_limpar.clicked.connect(self._on_btn_limpar)
         lay.addWidget(self.btn_limpar)
 
@@ -357,7 +486,7 @@ class JanelaPrincipal(QWidget):
         lay.addWidget(self.barra)
 
         self.lbl_status = QLabel("")
-        self.lbl_status.setStyleSheet("color: #555;")
+        self.lbl_status.setObjectName("lbl_status")
         lay.addWidget(self.lbl_status)
 
         self.log_area = QPlainTextEdit()
@@ -377,7 +506,7 @@ class JanelaPrincipal(QWidget):
     def _linha(self) -> QFrame:
         ln = QFrame()
         ln.setFrameShape(QFrame.HLine)
-        ln.setStyleSheet("color: #ddd;")
+        ln.setObjectName("linha")
         return ln
 
     # ── seleção de entrada ─────────────────────────────────────────────────── #
@@ -389,7 +518,8 @@ class JanelaPrincipal(QWidget):
             self.lbl_entrada.setText(f"{tipo} selecionado: {p}")
         else:
             self.lbl_entrada.setText(f"{len(self.entradas)} PDFs selecionados")
-        self.lbl_entrada.setStyleSheet("color: #222;")
+        self.lbl_entrada.setProperty("definida", "true")
+        _repolir(self.lbl_entrada)
         self.box_opcoes.setEnabled(True)
         self.btn_limpar.setEnabled(True)
 
@@ -414,7 +544,7 @@ class JanelaPrincipal(QWidget):
         self._processando = True
         self._pasta_saida = None
         self.btn_limpar.setText("Cancelar")
-        self.btn_limpar.setStyleSheet(ESTILO_BTN_CANCELAR)
+        self._marcar_botao_perigo(True)
         self.area_drop.setEnabled(False)
         self.box_opcoes.setEnabled(False)
         self.barra.show()
@@ -466,13 +596,19 @@ class JanelaPrincipal(QWidget):
         QMessageBox.critical(self, "Erro", msg)
         self.lbl_status.setText("Erro. Verifique os arquivos e tente novamente.")
 
+    def _marcar_botao_perigo(self, perigo: bool):
+        """Alterna o botão principal entre ação (azul) e destrutiva (vermelho)
+        via propriedade dinâmica [modo] — as cores vivem no TEMA_QSS central."""
+        self.btn_limpar.setProperty("modo", "perigo" if perigo else "acao")
+        _repolir(self.btn_limpar)
+
     def _restaurar_ui(self):
         self._processando = False
         self.area_drop.setEnabled(True)
         self.box_opcoes.setEnabled(bool(self.entradas))
         self.btn_limpar.setEnabled(True)
         self.btn_limpar.setText("Limpar")
-        self.btn_limpar.setStyleSheet(ESTILO_BTN_LIMPAR)
+        self._marcar_botao_perigo(False)
 
     def _abrir_pasta(self):
         if self._pasta_saida and self._pasta_saida.is_dir():
@@ -481,8 +617,7 @@ class JanelaPrincipal(QWidget):
 
 def main():
     app = QApplication(sys.argv)
-    app.setStyle("Fusion")
-    app.setStyleSheet(APP_STYLESHEET)
+    aplicar_tema(app)
     win = JanelaPrincipal()
     win.show()
     sys.exit(app.exec())
