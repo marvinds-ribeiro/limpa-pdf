@@ -883,10 +883,9 @@ def _preparar_ocr():
     return "eng", ""
 
 
-# Limiar de área (fração da página) para considerar uma imagem EMBUTIDA
-# relevante. Acima de IMG_PAGINA_FRAC tratamos como "página-imagem" inteira
-# (página escaneada/desenhada), que o OCR já cobre e NÃO gera aviso.
-IMG_EMBUTIDA_FRAC = 0.04   # >= 4% da página = imagem relevante a sinalizar
+# Limiar de área (fração da página) acima do qual a imagem É a própria página
+# (página escaneada/desenhada): protegida na limpeza e coberta pelo OCR de
+# página inteira.
 IMG_PAGINA_FRAC = 0.80     # >= 80% da página = a própria página é imagem
 
 # --------------------------- exportação em Markdown (v2.8) ------------------
@@ -911,75 +910,6 @@ UNIDADE_REGEX = re.compile(
 # Confiança média (0-100) abaixo da qual um bloco de OCR de imagem embutida é
 # marcado no .md como "baixa confiança — conferir no original".
 IMG_OCR_CONF_BAIXA = 60
-
-
-def _detectar_tabelas_imagens(pdf_path: Path):
-    """Detecta, página a página, a presença de TABELAS e de IMAGENS EMBUTIDAS
-    relevantes, para gerar avisos no .txt.
-
-    Objetivo: rede de segurança. Quando uma página tem texto (extraído
-    normalmente) mas também traz uma TABELA ou uma IMAGEM embutida (uma foto,
-    print, documento anexado — possível prova), o conteúdo visual não vira
-    texto e poderia passar despercebido na leitura do .txt. O aviso chama a
-    atenção do usuário (ou da IA) para conferir aquela página no original.
-
-    Critérios:
-      - Tabela: grade detectada pelo pdfplumber (linhas/bordas formando
-        células). Robusto e independente de heurística de texto.
-      - Imagem embutida: imagem cuja área seja >= IMG_EMBUTIDA_FRAC da página
-        e < IMG_PAGINA_FRAC (acima disso é a própria página escaneada, que o
-        OCR cobre e não deve gerar aviso redundante).
-
-    Retorna dict {indice_pagina(0-based): {"tabela": bool, "imagem": bool}}
-    contendo APENAS páginas com algo a sinalizar. Em caso de falha (pdfplumber
-    ausente etc.), retorna {} silenciosamente — o aviso é um extra, nunca deve
-    quebrar a geração do .txt."""
-    try:
-        import pdfplumber
-    except Exception:
-        return {}
-
-    avisos = {}
-    try:
-        with pdfplumber.open(str(pdf_path)) as pdf:
-            for i, p in enumerate(pdf.pages):
-                area_pg = (p.width or 1) * (p.height or 1)
-
-                tem_tabela = False
-                try:
-                    tem_tabela = len(p.find_tables()) > 0
-                except Exception:
-                    tem_tabela = False
-
-                tem_imagem = False
-                try:
-                    for im in (p.images or []):
-                        w = abs(float(im.get("x1", 0)) - float(im.get("x0", 0)))
-                        h = abs(float(im.get("bottom", 0)) - float(im.get("top", 0)))
-                        frac = (w * h) / area_pg if area_pg else 0.0
-                        if IMG_EMBUTIDA_FRAC <= frac < IMG_PAGINA_FRAC:
-                            tem_imagem = True
-                            break
-                except Exception:
-                    tem_imagem = False
-
-                if tem_tabela or tem_imagem:
-                    avisos[i] = {"tabela": tem_tabela, "imagem": tem_imagem}
-    except Exception:
-        return {}
-    return avisos
-
-
-def _texto_aviso(info):
-    """Monta o texto do aviso para uma página, a partir do dict {tabela, imagem}."""
-    if info.get("tabela") and info.get("imagem"):
-        alvo = "tabela e imagem"
-    elif info.get("tabela"):
-        alvo = "tabela"
-    else:
-        alvo = "imagem"
-    return (f">> AVISO: esta pagina contem {alvo} - revisar no PDF original "
-            f"(conteudo visual pode nao ter sido capturado no texto).")
 
 
 def _detectar_peca(linha: str):
@@ -1869,10 +1799,6 @@ def main():
     ap.add_argument("--max-paginas", type=int, default=MAX_PAGINAS,
                     help=f"divide PDFs maiores que N páginas (padrão {MAX_PAGINAS};"
                          " use 0 para não dividir)")
-    ap.add_argument("--sem-avisos-tabela-imagem", action="store_true",
-                    help="NÃO insere no .txt os avisos de páginas com"
-                         " tabela/imagem (por padrão os avisos são incluídos"
-                         " junto com --txt como rede de segurança)")
     ap.add_argument("--sem-numero", action="store_true",
                     help="NÃO carimba o número da página no canto superior"
                          " direito (por padrão a paginação contínua é"
