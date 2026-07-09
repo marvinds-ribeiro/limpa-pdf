@@ -1313,6 +1313,22 @@ OCR_MIN_FRAC_ALNUM = 0.45   # texto bom tem >= 45% de caracteres alfanuméricos
 OCR_MAX_FRAC_LIXO = 0.20    # texto bom tem <= 20% de caracteres de controle/PUA
 OCR_MIN_CHARS_AVAL = 20     # só avalia qualidade a partir deste tamanho
 
+# --- OCR por REGIÃO de imagem embutida (v2.8) --------------------------------
+# Páginas com texto de corpo podem trazer PRINTS/documentos como imagens
+# embutidas (prova!) que o fluxo de página inteira nunca lia. Filtro de
+# candidatas (medido nos exemplos reais): logo do MPSC ~0.014 da página;
+# prints 0.024-0.063. O corte em 0.02 exclui o logo e mantém os prints.
+IMG_OCR_FRAC_MIN = 0.02        # fração mínima da página p/ OCR de região
+IMG_OCR_ZONA_CABECALHO = 0.15  # topo da página onde imagem = logo/timbre
+# Deduplicação tolerante: fração mínima de palavras (>=4 letras) do texto da
+# imagem presentes no corpo para considerá-lo repetido (e não duplicar).
+OCR_DEDUP_FRAC = 0.80
+# Página MANUSCRITA (best-effort honesto): quase sem texto de corpo e com
+# imagem grande. O Tesseract NÃO lê cursiva com fidelidade — o .md marca.
+# Medido no exemplo real: 18 chars/página + imagens de fração 0.33.
+MANUSCRITO_MAX_TEXTO = 40    # corpo com menos chars que isso = "sem texto"
+MANUSCRITO_FRAC_MIN = 0.25   # imagem com fração >= isso = possível manuscrito
+
 
 def _qualidade_texto(t: str):
     """Mede a fração de caracteres alfanuméricos e a fração de 'lixo'
@@ -1421,6 +1437,108 @@ def _preparar_imagem_ocr(img):
         return img.convert("L")
 
 
+def _imagem_candidata_ocr(bbox, W, H) -> bool:
+    """True se a imagem embutida deve receber OCR de região: grande o
+    bastante para ter conteúdo (>= IMG_OCR_FRAC_MIN), menor que a página
+    escaneada (< IMG_PAGINA_FRAC, já coberta pelo fluxo de página inteira) e
+    fora da zona de cabeçalho (logo/timbre). bbox em pontos, origem
+    inferior-esquerda."""
+    if not W or not H or not bbox:
+        return False
+    w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    if w <= 0 or h <= 0:
+        return False
+    frac = (w * h) / (W * H)
+    if frac < IMG_OCR_FRAC_MIN or frac >= IMG_PAGINA_FRAC:
+        return False
+    if bbox[1] >= H * (1 - IMG_OCR_ZONA_CABECALHO):
+        return False
+    return True
+
+
+def _texto_contido(menor: str, maior: str) -> bool:
+    """Comparação TOLERANTE de conteúdo: True se >= OCR_DEDUP_FRAC das
+    palavras substantivas (>= 4 letras) de 'menor' aparecem em 'maior'.
+    Usada para não duplicar no .md o texto de uma imagem que é apenas a
+    versão rasterizada do próprio corpo."""
+    pm = set(re.findall(r"\w{4,}", (menor or "").lower()))
+    if not pm:
+        return False
+    pg = set(re.findall(r"\w{4,}", (maior or "").lower()))
+    return len(pm & pg) / len(pm) >= OCR_DEDUP_FRAC
+
+
+def _escala_render(page) -> float:
+    """Escala de renderização p/ OCR: OCR_DPI com o cap OCR_MAX_LADO_PX."""
+    escala = OCR_DPI / 72.0
+    box = page.mediabox
+    w_pt = float(box[2]) - float(box[0])
+    h_pt = float(box[3]) - float(box[1])
+    if max(w_pt, h_pt) * escala > OCR_MAX_LADO_PX:
+        escala = OCR_MAX_LADO_PX / max(w_pt, h_pt)
+    return escala
+
+
+def _garantir_fonte(pdf, page, nome: str):
+    """Garante a fonte Helvetica 'nome' (ex.: '/FOCR') nos /Resources."""
+    res = page.get("/Resources")
+    if res is None:
+        res = pikepdf.Dictionary()
+        page.Resources = res
+    fontes = res.get("/Font")
+    if fontes is None:
+        fontes = pikepdf.Dictionary()
+        res.Font = fontes
+    if nome not in fontes:
+        fontes[nome] = pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name.Font, Subtype=pikepdf.Name.Type1,
+            BaseFont=pikepdf.Name.Helvetica,
+            Encoding=pikepdf.Name.WinAnsiEncoding))
+
+
+def _linhas_texto_ocr(dados, x0, y0, H, sx, sy, dx_px=0.0, dy_px=0.0):
+    """Converte o dict do image_to_data em instruções de texto invisível,
+    palavra a palavra, com a matemática de alinhamento da v2.3+ (fs pela
+    altura da bbox, Tz pela largura real na Helvetica, corte conf >= 40).
+    (dx_px, dy_px) deslocam as coordenadas quando 'dados' veio de um RECORTE
+    da página renderizada (OCR de imagem embutida); 0,0 = página inteira.
+    Retorna (linhas: list[bytes], palavras: list[str], confs: list[int])."""
+    linhas, palavras, confs = [], [], []
+    for j in range(len(dados["text"])):
+        w = _normalizar_ocr((dados["text"][j] or "").strip())
+        try:
+            conf = int(float(dados["conf"][j]))
+        except Exception:
+            conf = -1
+        if not w or conf < 40:
+            continue
+        left = dados["left"][j] + dx_px
+        top = dados["top"][j] + dy_px
+        wpx, hpx = dados["width"][j], dados["height"][j]
+        # bbox da palavra em pontos de página (Y do PDF cresce p/ cima)
+        x = x0 + left * sx
+        base_bbox = y0 + H - (top + hpx) * sy   # fundo da bbox da palavra
+        larg_pt = max(wpx * sx, 1.0)
+        alt_pt = max(hpx * sy, 4.0)
+        # A bbox do Tesseract abrange a altura visível da palavra; numa fonte
+        # como a Helvetica as maiúsculas ocupam ~72% do corpo, logo o tamanho
+        # de fonte ≈ altura_bbox / 0.72.
+        fs = max(alt_pt / 0.72, 4.0)
+        # A baseline fica ligeiramente acima do fundo da bbox (descender).
+        y = base_bbox + alt_pt * 0.18
+        # Escala horizontal: faz a palavra cobrir exatamente larg_pt.
+        w_natural = max(_larg_helvetica(w) * fs, 0.1)
+        tz = max(1.0, min(1000.0, larg_pt / w_natural * 100.0))
+        pal = _escapa_pdf(w.encode("cp1252", errors="replace"))
+        linhas.append(
+            f"{tz:.1f} Tz /FOCR {fs:.2f} Tf "
+            f"1 0 0 1 {x:.2f} {y:.2f} Tm ".encode("latin-1")
+            + b"(" + pal + b") Tj")
+        palavras.append(w)
+        confs.append(conf)
+    return linhas, palavras, confs
+
+
 def embutir_ocr(pdf_path: Path, lang: str, cfg: str) -> int:
     """Acrescenta, nas páginas SEM camada de texto, texto invisível de OCR
     (Text Rendering Mode 3) POR CIMA do conteúdo, palavra a palavra, para
@@ -1466,18 +1584,9 @@ def embutir_ocr(pdf_path: Path, lang: str, cfg: str) -> int:
                           f" {i + 1}: {e}")
             # Render em OCR_DPI (400): mais pixels por glifo, menos colapso de
             # letras finas. Pré-processa (cinza + contraste + binarização) para
-            # destacar o texto cinza serrilhado antes de reconhecer.
-            # Cap de segurança: páginas com mediabox gigante (alguns scans do
-            # SIG têm 2290x3286 pt) gerariam imagens de >12000 px a 400 dpi,
-            # estourando memória/tempo sem ganho. Limitamos o maior lado.
-            escala = OCR_DPI / 72.0
-            box0 = page.mediabox
-            w_pt = float(box0[2]) - float(box0[0])
-            h_pt = float(box0[3]) - float(box0[1])
-            maior_px = max(w_pt, h_pt) * escala
-            if maior_px > OCR_MAX_LADO_PX:
-                escala = OCR_MAX_LADO_PX / max(w_pt, h_pt)
-            img = doc[i].render(scale=escala).to_pil()
+            # destacar o texto cinza serrilhado antes de reconhecer. A escala
+            # tem o cap OCR_MAX_LADO_PX p/ mediabox gigante (_escala_render).
+            img = doc[i].render(scale=_escala_render(page)).to_pil()
             img_ocr = _preparar_imagem_ocr(img)
             print(f"   OCR pagina {i + 1}...", flush=True)
             dados = pytesseract.image_to_data(
@@ -1495,64 +1604,15 @@ def embutir_ocr(pdf_path: Path, lang: str, cfg: str) -> int:
             # pontos de página fiquem absolutas e o texto caia EXATAMENTE sobre
             # a imagem.
             m_inv = _inverter_matriz(_ctm_residual(page)) or I
-            linhas = [
-                b"q",
-                ("%.6f %.6f %.6f %.6f %.4f %.4f cm" % m_inv).encode("latin-1"),
-                b"BT", b"3 Tr",
-            ]
-            n_pal = 0
-            n_total = len(dados["text"])
-            for j in range(n_total):
-                w = (dados["text"][j] or "").strip()
-                w = _normalizar_ocr(w)
-                try:
-                    conf = int(float(dados["conf"][j]))
-                except Exception:
-                    conf = -1
-                if not w or conf < 40:
-                    continue
-                left = dados["left"][j]
-                top = dados["top"][j]
-                wpx = dados["width"][j]
-                hpx = dados["height"][j]
-                # bbox da palavra em pontos de página (Y do PDF cresce p/ cima)
-                x = x0 + left * sx
-                base_bbox = y0 + H - (top + hpx) * sy   # fundo da bbox da palavra
-                larg_pt = max(wpx * sx, 1.0)
-                alt_pt = max(hpx * sy, 4.0)
-                # A bbox do Tesseract abrange a altura visível da palavra; numa
-                # fonte como a Helvetica as maiúsculas ocupam ~72% do corpo, logo
-                # o tamanho de fonte ≈ altura_bbox / 0.72.
-                fs = max(alt_pt / 0.72, 4.0)
-                # A baseline fica ligeiramente acima do fundo da bbox (descender).
-                y = base_bbox + alt_pt * 0.18
-                # Escala horizontal: faz a palavra cobrir exatamente larg_pt.
-                w_natural = _larg_helvetica(w) * fs
-                if w_natural < 0.1:
-                    w_natural = 0.1
-                tz = max(1.0, min(1000.0, larg_pt / w_natural * 100.0))
-                pal = _escapa_pdf(w.encode("cp1252", errors="replace"))
-                linhas.append(
-                    f"{tz:.1f} Tz /FOCR {fs:.2f} Tf "
-                    f"1 0 0 1 {x:.2f} {y:.2f} Tm ".encode("latin-1")
-                    + b"(" + pal + b") Tj")
-                n_pal += 1
-            linhas += [b"ET", b"Q"]
-            if n_pal == 0:
+            corpo_ocr, _pals, _confs = _linhas_texto_ocr(
+                dados, x0, y0, H, sx, sy)
+            if not corpo_ocr:
                 continue
-            res = page.get("/Resources")
-            if res is None:
-                res = pikepdf.Dictionary()
-                page.Resources = res
-            fontes = res.get("/Font")
-            if fontes is None:
-                fontes = pikepdf.Dictionary()
-                res.Font = fontes
-            if "/FOCR" not in fontes:
-                fontes["/FOCR"] = pdf.make_indirect(pikepdf.Dictionary(
-                    Type=pikepdf.Name.Font, Subtype=pikepdf.Name.Type1,
-                    BaseFont=pikepdf.Name.Helvetica,
-                    Encoding=pikepdf.Name.WinAnsiEncoding))
+            linhas = ([b"q",
+                       ("%.6f %.6f %.6f %.6f %.4f %.4f cm" % m_inv)
+                       .encode("latin-1"),
+                       b"BT", b"3 Tr"] + corpo_ocr + [b"ET", b"Q"])
+            _garantir_fonte(pdf, page, "/FOCR")
             page.contents_add(pdf.make_stream(b"\n".join(linhas)),
                               prepend=False)
             n_ocr += 1
@@ -1629,19 +1689,7 @@ def numerar_paginas(pdf_path: Path, total: int, inicio: int = 1) -> int:
                 b"ET",
                 b"Q",
             ]
-            res = page.get("/Resources")
-            if res is None:
-                res = pikepdf.Dictionary()
-                page.Resources = res
-            fontes = res.get("/Font")
-            if fontes is None:
-                fontes = pikepdf.Dictionary()
-                res.Font = fontes
-            if "/FNUM" not in fontes:
-                fontes["/FNUM"] = pdf.make_indirect(pikepdf.Dictionary(
-                    Type=pikepdf.Name.Font, Subtype=pikepdf.Name.Type1,
-                    BaseFont=pikepdf.Name.Helvetica,
-                    Encoding=pikepdf.Name.WinAnsiEncoding))
+            _garantir_fonte(pdf, page, "/FNUM")
             page.contents_add(pdf.make_stream(b"\n".join(linhas)),
                               prepend=False)
             n_num += 1
