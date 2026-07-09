@@ -20,7 +20,7 @@ def test_cancela_apos_limpa_pdf_do_primeiro_arquivo(qapp, tmp_path):
 
     opcoes = {
         "ocr": False, "paginar": False, "dividir": False,
-        "max_pag": 0, "txt": False, "sem_cabecalho": True,
+        "max_pag": 0, "md": False, "sem_cabecalho": True,
     }
     resultados = {}
 
@@ -52,7 +52,7 @@ def test_emite_cancelado_false_quando_completo(qapp, tmp_path):
 
     opcoes = {
         "ocr": False, "paginar": False, "dividir": False,
-        "max_pag": 0, "txt": False, "sem_cabecalho": True,
+        "max_pag": 0, "md": False, "sem_cabecalho": True,
     }
     resultados = {}
 
@@ -78,7 +78,7 @@ def test_emite_cancelado_false_quando_completo(qapp, tmp_path):
 def test_erro_quando_sem_pdfs(qapp, tmp_path):
     opcoes = {
         "ocr": False, "paginar": False, "dividir": False,
-        "max_pag": 0, "txt": False, "sem_cabecalho": True,
+        "max_pag": 0, "md": False, "sem_cabecalho": True,
     }
     erros = []
 

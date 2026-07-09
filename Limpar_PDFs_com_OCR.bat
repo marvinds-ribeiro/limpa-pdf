@@ -21,7 +21,7 @@ if errorlevel 1 (
   pause & exit /b
 )
 echo Limpando PDFs de: %~1  ^(com OCR - pode demorar^)
-python "%~dp0limpa_pdf_mpsc.py" "%~1" --sem-cabecalho --txt --ocr
+python "%~dp0limpa_pdf_mpsc.py" "%~1" --sem-cabecalho --md --ocr
 echo.
-echo Fim. Se apareceu [OK] acima, os *_limpo.pdf e *_limpo.txt estao prontos.
+echo Fim. Se apareceu [OK] acima, os *_limpo.pdf e *_limpo.md estao prontos.
 pause

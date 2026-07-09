@@ -982,80 +982,6 @@ def _texto_aviso(info):
             f"(conteudo visual pode nao ter sido capturado no texto).")
 
 
-def exportar_txt(pdf_path: Path, txt_path: Path, avisos=None, offset: int = 1):
-    """Extrai o texto do PDF (com pypdfium2; pdfplumber é reserva).
-
-    'offset' é o número (1-based) da primeira página desta parte no documento
-    inteiro, para que o cabeçalho "===== Pagina N =====" seja CONTÍNUO entre as
-    partes (casando com o número carimbado no PDF). 'avisos' é indexado por
-    página 0-based DENTRO desta parte.
-
-    Se 'avisos' (dict de _detectar_tabelas_imagens) for fornecido, insere um
-    RESUMO no topo do .txt e um aviso inline no cabeçalho de cada página
-    afetada, para sinalizar tabelas/imagens que merecem conferência no
-    original.
-
-    Páginas cujo texto extraído seja vazio OU lixo (fonte sem /ToUnicode, não
-    corrigida por falta de --ocr) recebem o aviso de página sem texto, em vez
-    de despejar o lixo no .txt."""
-    avisos = avisos or {}
-    motor = None
-    try:
-        import pypdfium2 as pdfium
-        motor = "pdfium"
-    except Exception:
-        try:
-            import pdfplumber  # noqa: F401
-            motor = "plumber"
-        except Exception as e:
-            print(f"   [aviso] .txt nao gerado ({e}). Rode no terminal:"
-                  "  python -m pip install pypdfium2")
-            return
-    aviso_sem_texto = ("[pagina sem texto aproveitavel - use --ocr"
-                       " (com o Tesseract instalado) para extrair]")
-    saida = []
-    if motor == "pdfium":
-        import pypdfium2 as pdfium
-        doc = pdfium.PdfDocument(str(pdf_path))
-        for i in range(len(doc)):
-            tp = doc[i].get_textpage()
-            texto = (tp.get_text_range() or "").strip()
-            tp.close()
-            if not _texto_e_aproveitavel(texto):
-                texto = aviso_sem_texto
-            cab = f"===== Pagina {offset + i} ====="
-            if i in avisos:
-                cab += "\n" + _texto_aviso(avisos[i])
-            saida.append(f"{cab}\n{texto}")
-        doc.close()
-    else:
-        import pdfplumber
-        with pdfplumber.open(str(pdf_path)) as pl:
-            for i, p in enumerate(pl.pages):
-                texto = (p.extract_text() or "").strip()
-                if not _texto_e_aproveitavel(texto):
-                    texto = aviso_sem_texto
-                cab = f"===== Pagina {offset + i} ====="
-                if i in avisos:
-                    cab += "\n" + _texto_aviso(avisos[i])
-                saida.append(f"{cab}\n{texto}")
-    corpo = "\n\n".join(saida)
-    if avisos:
-        pags = sorted(offset + k for k in avisos)
-        lista = ", ".join(str(n) for n in pags)
-        resumo = (
-            "############################################################\n"
-            "# ATENCAO - REDE DE SEGURANCA (revisao no original)\n"
-            f"# Paginas com tabela/imagem a conferir: {lista}\n"
-            "# O texto abaixo pode NAO conter tabelas/imagens dessas\n"
-            "# paginas. Verifique-as no PDF original para nao perder\n"
-            "# informacao ou prova relevante.\n"
-            "############################################################"
-        )
-        corpo = resumo + "\n\n" + corpo
-    txt_path.write_text(corpo, encoding="utf-8")
-
-
 def _detectar_peca(linha: str):
     """Rótulo da peça se a LINHA inicia uma peça processual; senão None.
     Conservador (CLAUDE.md §5): só linha CURTA, toda MAIÚSCULA e começando
@@ -1775,7 +1701,9 @@ def main():
     ap.add_argument("--saida", help="Pasta de saída (padrão: sufixo _limpo)")
     ap.add_argument("--sem-cabecalho", action="store_true",
                     help="Remove cabeçalho/rodapé (texto, logos e linhas)")
-    ap.add_argument("--txt", action="store_true", help="Exporta .txt limpo")
+    ap.add_argument("--md", "--txt", dest="md", action="store_true",
+                    help="Exporta o conteúdo em Markdown (.md) estruturado"
+                         " para colar na IA (--txt é alias antigo)")
     ap.add_argument("--ocr", action="store_true",
                     help="OCR nas páginas sem camada de texto (requer Tesseract):"
                          " o texto fica selecionável no PDF e entra no .txt")
@@ -1831,13 +1759,19 @@ def main():
                           " selecionável).")
             except Exception as e:
                 print(f"   [aviso] OCR falhou: {e}")
+        # Total de páginas do documento limpo (já com OCR): usado tanto pela
+        # paginação carimbada quanto pelo "## Página N de TOTAL" do .md.
+        total_pag = 0
+        try:
+            with pikepdf.open(destino) as _p:
+                total_pag = len(_p.pages)
+        except Exception:
+            pass
         # Paginação CONTÍNUA: carimba os números ANTES de dividir, sobre o PDF
         # inteiro, para que a contagem vá de 1 ao total sem reiniciar a cada
-        # parte. O total é o nº de páginas do documento limpo (já com OCR).
-        if not args.sem_numero:
+        # parte.
+        if not args.sem_numero and total_pag:
             try:
-                with pikepdf.open(destino) as _p:
-                    total_pag = len(_p.pages)
                 numerar_paginas(destino, total_pag, inicio=1)
                 print(f"   Paginas numeradas (1 a {total_pag}) no canto"
                       " superior direito.")
@@ -1851,24 +1785,14 @@ def main():
         nomes = []
         for parte, offset in partes:
             nomes.append(parte.name)
-            if args.txt:
-                txt = parte.with_suffix(".txt")
-                avisos = {}
-                if not args.sem_avisos_tabela_imagem:
-                    try:
-                        avisos = _detectar_tabelas_imagens(parte)
-                    except Exception as e:
-                        print(f"   [aviso] deteccao de tabela/imagem falhou ({e}).")
-                        avisos = {}
+            if args.md:
+                md = parte.with_suffix(".md")
                 try:
-                    exportar_txt(parte, txt, avisos, offset=offset)
-                    if txt.is_file():
-                        nomes.append(txt.name)
-                        if avisos:
-                            pp = ", ".join(str(offset + k) for k in sorted(avisos))
-                            print(f"   Aviso de tabela/imagem nas paginas: {pp}")
+                    exportar_md(parte, md, offset=offset, total=total_pag)
+                    if md.is_file():
+                        nomes.append(md.name)
                 except Exception as e:
-                    print(f"   [aviso] falha ao gerar {txt.name}: {e}")
+                    print(f"   [aviso] falha ao gerar {md.name}: {e}")
         print(f"[OK] {arq.name} -> {', '.join(nomes)} ({n} páginas alteradas)")
 
 

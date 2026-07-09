@@ -11,7 +11,7 @@ Pipeline (idêntico ao main() do CLI):
     2. embutir_ocr(destino, lang, cfg)            # se OCR ligado
     3. numerar_paginas(destino, total, inicio=1)  # se paginação ligada (PDF inteiro)
     4. dividir_pdf(destino, max_pag) -> [(parte, offset), ...]
-    5. para cada parte: _detectar_tabelas_imagens + exportar_txt(offset=offset)  # se TXT
+    5. para cada parte: exportar_md(offset=offset, total=total)  # se .md ligado
 
 Decisões (CLAUDE.md §7/§8):
     - PySide6 (LGPL), drag-and-drop nativo.
@@ -286,12 +286,19 @@ class Worker(QThread):
                 if self._cancelar:
                     break
 
-            if op["paginar"]:
+            # Total de páginas do PDF limpo (já com OCR): usado pela paginação
+            # carimbada e pelo "## Página N de TOTAL" do .md.
+            total_pag = 0
+            try:
+                import pikepdf
+                with pikepdf.open(destino) as _p:
+                    total_pag = len(_p.pages)
+            except Exception:
+                pass
+
+            if op["paginar"] and total_pag:
                 self.log.emit(f"[{k+1}/{total}] Numerando páginas de {arq.name}...")
                 try:
-                    import pikepdf
-                    with pikepdf.open(destino) as _p:
-                        total_pag = len(_p.pages)
                     core.numerar_paginas(destino, total_pag, inicio=1)
                 except Exception as e:
                     self.log.emit(f"[AVISO] Numeração falhou: {e}")
@@ -304,18 +311,15 @@ class Worker(QThread):
 
             for parte, offset in partes:
                 gerados.append(parte.name)
-                if op["txt"]:
-                    txt = parte.with_suffix(".txt")
+                if op["md"]:
+                    md = parte.with_suffix(".md")
                     try:
-                        avisos = core._detectar_tabelas_imagens(parte)
-                    except Exception:
-                        avisos = {}
-                    try:
-                        core.exportar_txt(parte, txt, avisos, offset=offset)
-                        if txt.is_file():
-                            gerados.append(txt.name)
+                        core.exportar_md(parte, md, offset=offset,
+                                         total=total_pag)
+                        if md.is_file():
+                            gerados.append(md.name)
                     except Exception as e:
-                        self.log.emit(f"[AVISO] TXT falhou: {e}")
+                        self.log.emit(f"[AVISO] .md falhou: {e}")
 
         cancelado = self._cancelar
         if cancelado:
@@ -450,9 +454,9 @@ class JanelaPrincipal(QWidget):
 
         self.chk_ocr = QCheckBox("Reconhecer texto de páginas escaneadas (OCR) — mais lento")
         self.chk_pag = QCheckBox("Numerar as páginas (recomendado para citar páginas à IA)")
-        self.chk_txt = QCheckBox("Gerar arquivo de texto (.txt) para colar na IA")
+        self.chk_md = QCheckBox("Gerar arquivo de texto (.md) para colar na IA")
         self.chk_pag.setChecked(True)
-        self.chk_txt.setChecked(True)
+        self.chk_md.setChecked(True)
 
         div = QHBoxLayout()
         self.chk_div = QCheckBox("Dividir PDFs grandes em partes de")
@@ -469,7 +473,7 @@ class JanelaPrincipal(QWidget):
         op.addWidget(self.chk_ocr)
         op.addWidget(self.chk_pag)
         op.addLayout(div)
-        op.addWidget(self.chk_txt)
+        op.addWidget(self.chk_md)
         self.box_opcoes.setEnabled(False)
         lay.addWidget(self.box_opcoes)
 
@@ -538,7 +542,7 @@ class JanelaPrincipal(QWidget):
             "paginar":       self.chk_pag.isChecked(),
             "dividir":       self.chk_div.isChecked(),
             "max_pag":       self.spin_pag.value(),
-            "txt":           self.chk_txt.isChecked(),
+            "md":            self.chk_md.isChecked(),
             "sem_cabecalho": True,
         }
         self._processando = True
