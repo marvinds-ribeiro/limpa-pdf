@@ -20,12 +20,12 @@ def test_cancela_apos_limpa_pdf_do_primeiro_arquivo(qapp, tmp_path):
 
     opcoes = {
         "ocr": False, "paginar": False, "dividir": False,
-        "max_pag": 0, "md": False, "sem_cabecalho": True,
+        "max_mb": 0, "md": False, "sem_cabecalho": True,
     }
     resultados = {}
 
     with patch("gui.core") as mock_core:
-        mock_core.MAX_PAGINAS = 150
+        mock_core.MAX_MB_PARTE = 100
 
         def limpa_e_cancela(src, dst, sem_cab):
             limpos.mkdir(parents=True, exist_ok=True)
@@ -52,12 +52,12 @@ def test_emite_cancelado_false_quando_completo(qapp, tmp_path):
 
     opcoes = {
         "ocr": False, "paginar": False, "dividir": False,
-        "max_pag": 0, "md": False, "sem_cabecalho": True,
+        "max_mb": 0, "md": False, "sem_cabecalho": True,
     }
     resultados = {}
 
     with patch("gui.core") as mock_core:
-        mock_core.MAX_PAGINAS = 150
+        mock_core.MAX_MB_PARTE = 100
 
         def fake_limpa(src, dst, sem_cab):
             limpos.mkdir(parents=True, exist_ok=True)
@@ -78,7 +78,7 @@ def test_emite_cancelado_false_quando_completo(qapp, tmp_path):
 def test_erro_quando_sem_pdfs(qapp, tmp_path):
     opcoes = {
         "ocr": False, "paginar": False, "dividir": False,
-        "max_pag": 0, "md": False, "sem_cabecalho": True,
+        "max_mb": 0, "md": False, "sem_cabecalho": True,
     }
     erros = []
 

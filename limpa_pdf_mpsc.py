@@ -99,7 +99,12 @@ ZONA_TOPO = 0.30        # fração superior da página onde boilerplate pode viv
 ZONA_BASE = 0.12        # fração inferior
 FRACAO_REPETICAO = 0.25 # elemento repetido em >= max(3, 25% das págs) = boilerplate
 CANTO_X, CANTO_Y = 200, 230   # região do carimbo CÓPIA (canto sup. esquerdo)
-MAX_PAGINAS = 150       # divide PDFs maiores que isso em partes (0 = não dividir)
+# Divisão por TAMANHO (v2.8): o gargalo do Copilot/IPED é o tamanho do
+# arquivo, não a contagem de páginas (uma página escaneada pesa MUITAS vezes
+# mais que uma só-texto). Partes de até MAX_MB_PARTE megabytes; 0 = não
+# dividir. A margem deixa o arquivo final confortavelmente abaixo do teto.
+MAX_MB_PARTE = 100          # tamanho máximo de cada parte, em MB
+DIV_MARGEM_SEGURANCA = 0.90 # limite efetivo = max_mb * margem (folga)
 # Faixas fixas (fallback p/ docs curtos, em pontos) — apenas TEXTO:
 FAIXA_TOPO_TXT, FAIXA_BASE_TXT = 78, 70
 CANTO_DIR_X, CANTO_DIR_Y = 400, 95
@@ -1738,32 +1743,72 @@ def numerar_paginas(pdf_path: Path, total: int, inicio: int = 1) -> int:
     return n_num
 
 
-def dividir_pdf(caminho: Path, max_pag: int):
-    """Divide o PDF em partes de até max_pag páginas. Retorna uma lista de
-    tuplas (arquivo, offset), onde 'offset' é o número (1-based) da PRIMEIRA
-    página daquela parte no documento inteiro — usado para manter a numeração
-    contínua no .txt (parte02 começa em max_pag+1, e assim por diante). O
-    original é substituído pelas partes."""
-    if not max_pag or max_pag <= 0:
+def _salvar_bloco(pdf, ini: int, fim: int, destino: Path) -> int:
+    """Grava as páginas [ini, fim) num novo PDF e devolve o tamanho REAL em
+    bytes do arquivo salvo (mesma compressão do fluxo normal)."""
+    novo = pikepdf.new()
+    for p in pdf.pages[ini:fim]:
+        novo.pages.append(p)
+    novo.save(destino, compress_streams=True,
+              object_stream_mode=pikepdf.ObjectStreamMode.generate)
+    return destino.stat().st_size
+
+
+def dividir_pdf(caminho: Path, max_mb: float):
+    """Divide o PDF em partes de até 'max_mb' MB (tamanho REAL do arquivo).
+
+    Estratégia CRESCER-GRAVAR-MEDIR: o bloco cresce página a página e, a cada
+    candidata, é GRAVADO em disco e MEDIDO — nada de estimar MB/página (o
+    peso de uma página NÃO é linear: uma escaneada/com prints pesa muitas
+    vezes mais que uma só-texto, e estimativas por stream subestimam o
+    arquivo final em 6-34%). Se a página candidata estoura o limite, ela NÃO
+    entra e vira o início da próxima parte. REGRA INVIOLÁVEL: nenhuma página
+    é perdida nem fracionada — uma página que sozinha excede o limite sai
+    numa parte própria, com aviso.
+
+    Retorna [(arquivo, offset)], offset = nº (1-based) da 1ª página da parte
+    no documento inteiro (numeração contínua no .md). O original é
+    substituído pelas partes. max_mb <= 0 = não dividir."""
+    if not max_mb or max_mb <= 0:
         return [(caminho, 1)]
-    with pikepdf.open(caminho) as pdf:
-        n = len(pdf.pages)
-        if n <= max_pag:
-            return [(caminho, 1)]
-        partes = []
-        k, i = 0, 0
-        while i < n:
-            k += 1
-            novo = pikepdf.new()
-            for p in pdf.pages[i:i + max_pag]:
-                novo.pages.append(p)
-            destino = caminho.with_name(f"{caminho.stem}_parte{k:02d}.pdf")
-            novo.save(destino, compress_streams=True,
-                      object_stream_mode=pikepdf.ObjectStreamMode.generate)
-            partes.append((destino, i + 1))   # offset = 1ª página desta parte
-            i += max_pag
+    limite = int(max_mb * 1024 * 1024 * DIV_MARGEM_SEGURANCA)
+    if caminho.stat().st_size <= limite:
+        return [(caminho, 1)]
+    tmp = caminho.with_name(caminho.stem + "_divisao_tmp.pdf")
+    partes = []
+    try:
+        with pikepdf.open(caminho) as pdf:
+            n = len(pdf.pages)
+            i, k = 0, 0
+            while i < n:
+                k += 1
+                fim = i + 1
+                tam = _salvar_bloco(pdf, i, fim, tmp)
+                if tam > limite:
+                    print(f"   [aviso] Pagina {i + 1} sozinha tem"
+                          f" {tam / 1048576.0:.1f} MB (acima do limite de"
+                          f" {max_mb:g} MB); mantida inteira para nao perder"
+                          " conteudo.")
+                else:
+                    # cresce enquanto o arquivo salvo couber no limite
+                    while fim < n and _salvar_bloco(pdf, i, fim + 1, tmp) <= limite:
+                        fim += 1
+                    if fim < n:
+                        _salvar_bloco(pdf, i, fim, tmp)  # regrava o aprovado
+                destino = caminho.with_name(f"{caminho.stem}_parte{k:02d}.pdf")
+                tmp.replace(destino)
+                partes.append((destino, i + 1))  # offset = 1ª página da parte
+                i = fim
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+    if len(partes) == 1:
+        # coube tudo numa parte (ex.: recompressão reduziu, ou página única
+        # gigante): mantém o nome original, sem sufixo _parte01
+        partes[0][0].replace(caminho)
+        return [(caminho, 1)]
     caminho.unlink()
-    print(f"   Dividido em {len(partes)} partes de ate {max_pag} paginas.")
+    print(f"   Dividido em {len(partes)} partes de ate {max_mb:g} MB.")
     return partes
 
 
@@ -1796,9 +1841,9 @@ def main():
     ap.add_argument("--ocr", action="store_true",
                     help="OCR nas páginas sem camada de texto (requer Tesseract):"
                          " o texto fica selecionável no PDF e entra no .txt")
-    ap.add_argument("--max-paginas", type=int, default=MAX_PAGINAS,
-                    help=f"divide PDFs maiores que N páginas (padrão {MAX_PAGINAS};"
-                         " use 0 para não dividir)")
+    ap.add_argument("--max-mb", type=float, default=MAX_MB_PARTE,
+                    help=f"divide o PDF em partes de até N megabytes (padrão"
+                         f" {MAX_MB_PARTE} MB; use 0 para não dividir)")
     ap.add_argument("--sem-numero", action="store_true",
                     help="NÃO carimba o número da página no canto superior"
                          " direito (por padrão a paginação contínua é"
@@ -1864,7 +1909,7 @@ def main():
             except Exception as e:
                 print(f"   [aviso] numeração de páginas falhou: {e}")
         try:
-            partes = dividir_pdf(destino, args.max_paginas)
+            partes = dividir_pdf(destino, args.max_mb)
         except Exception as e:
             print(f"   [aviso] não consegui dividir ({e}); arquivo único.")
             partes = [(destino, 1)]

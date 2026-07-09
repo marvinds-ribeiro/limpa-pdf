@@ -10,7 +10,7 @@ Pipeline (idêntico ao main() do CLI):
     1. limpa_pdf(origem, destino, sem_cabecalho)
     2. embutir_ocr(destino, lang, cfg)            # se OCR ligado
     3. numerar_paginas(destino, total, inicio=1)  # se paginação ligada (PDF inteiro)
-    4. dividir_pdf(destino, max_pag) -> [(parte, offset), ...]
+    4. dividir_pdf(destino, max_mb) -> [(parte, offset), ...]
     5. para cada parte: exportar_md(offset=offset, total=total)  # se .md ligado
 
 Decisões (CLAUDE.md §7/§8):
@@ -304,9 +304,9 @@ class Worker(QThread):
                 except Exception as e:
                     self.log.emit(f"[AVISO] Numeração falhou: {e}")
 
-            max_pag = op["max_pag"] if op["dividir"] else 0
+            max_mb = op["max_mb"] if op["dividir"] else 0
             try:
-                partes = core.dividir_pdf(destino, max_pag)
+                partes = core.dividir_pdf(destino, max_mb)
             except Exception:
                 partes = [(destino, 1)]
 
@@ -463,15 +463,15 @@ class JanelaPrincipal(QWidget):
         self.chk_md.setChecked(True)
 
         div = QHBoxLayout()
-        self.chk_div = QCheckBox("Dividir PDFs grandes em partes de")
+        self.chk_div = QCheckBox("Dividir PDFs grandes em partes de no máximo")
         self.chk_div.setChecked(True)
-        self.spin_pag = QSpinBox()
-        self.spin_pag.setRange(1, 9999)
-        self.spin_pag.setValue(core.MAX_PAGINAS)
-        self.spin_pag.setSuffix(" páginas")
-        self.chk_div.toggled.connect(self.spin_pag.setEnabled)
+        self.spin_mb = QSpinBox()
+        self.spin_mb.setRange(5, 5000)
+        self.spin_mb.setValue(core.MAX_MB_PARTE)
+        self.spin_mb.setSuffix(" MB")
+        self.chk_div.toggled.connect(self.spin_mb.setEnabled)
         div.addWidget(self.chk_div)
-        div.addWidget(self.spin_pag)
+        div.addWidget(self.spin_mb)
         div.addStretch()
 
         op.addWidget(self.chk_ocr)
@@ -545,7 +545,7 @@ class JanelaPrincipal(QWidget):
             "ocr":           self.chk_ocr.isChecked(),
             "paginar":       self.chk_pag.isChecked(),
             "dividir":       self.chk_div.isChecked(),
-            "max_pag":       self.spin_pag.value(),
+            "max_mb":        self.spin_mb.value(),
             "md":            self.chk_md.isChecked(),
             "sem_cabecalho": True,
         }
