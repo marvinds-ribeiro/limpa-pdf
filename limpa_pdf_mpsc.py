@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-limpa_pdf_mpsc.py — v2.7 — Limpeza em lote de PDFs exportados do SIG (Softplan/MPSC)
+limpa_pdf_mpsc.py — v2.8 — Limpeza em lote de PDFs exportados do SIG (Softplan/MPSC)
 
 Remove, em qualquer layout (GAECO, CAT, Promotorias...):
   1. Assinatura digital vertical da margem (texto rotacionado OU vetorizado) — sempre
@@ -10,10 +10,33 @@ Remove, em qualquer layout (GAECO, CAT, Promotorias...):
      pela régua separadora da própria página (--sem-cabecalho)
 
 Extras:
-  --txt  Exporta texto limpo (extração 100% Python; funciona no Windows)
-  --ocr  Usa OCR (Tesseract) nas páginas sem texto aproveitável (corpo
-         vetorizado/escaneado OU camada de texto corrompida), para que o
-         .txt não perca informação
+  --md      Exporta o conteúdo em Markdown estruturado (extração 100% Python;
+            --txt é alias antigo e também gera .md)
+  --ocr     OCR (Tesseract) nas páginas sem texto aproveitável E nas imagens
+            embutidas de páginas com texto (prints, documentos anexados)
+  --max-mb  Divide o resultado em partes de até N MB (padrão 100; 0 = não)
+
+Novidades da v2.8:
+  - SAÍDA SEMPRE EM MARKDOWN (.md): título com metadados (nº do processo,
+    unidade, total de páginas), "## Página N de TOTAL" contínuo entre partes,
+    peças processuais como "### <PEÇA>" (PECA_ROTULOS, detecção conservadora:
+    linha curta e MAIÚSCULA — prosa nunca vira heading) e tabelas Markdown
+    apenas quando reais (filtro TAB_MIN_LINHAS x TAB_MIN_COLUNAS). Os avisos
+    de tabela/imagem foram REMOVIDOS: o conteúdo das imagens agora é
+    extraído ativamente, e aviso virou ruído para a IA.
+  - OCR DE IMAGENS EMBUTIDAS: páginas com texto de corpo E prints/documentos
+    anexados como imagem (prova!) passam por OCR POR REGIÃO — texto invisível
+    selecionável no PDF (mesma matemática de alinhamento, deslocada pelo
+    recorte) + bloco marcado "[Texto extraído de imagem...]" no .md, com
+    deduplicação tolerante contra o corpo. O logo do MPSC é excluído por
+    fração de área (IMG_OCR_FRAC_MIN) e zona de cabeçalho. Páginas
+    MANUSCRITAS: OCR best-effort com banner explícito de baixa confiança
+    (o Tesseract não lê cursiva com fidelidade — não prometemos).
+  - DIVISÃO POR TAMANHO (MB): o gargalo do Copilot/IPED é o tamanho do
+    arquivo, não a contagem de páginas. Partes de até --max-mb MB (padrão
+    100), medindo o tamanho REAL gravado em disco (crescer-gravar-medir) —
+    nunca estima, nunca perde página; página que sozinha excede o limite sai
+    inteira, com aviso.
 
 Novidades da v2.7:
   - PROTEÇÃO DO CORPO ESCANEADO FATIADO EM TIRAS: scans do SIG frequentemente
@@ -77,7 +100,7 @@ Novidades da v2.3:
     renderizar a 300 dpi, melhorando o reconhecimento.
 
 Uso:
-  python limpa_pdf_mpsc.py "C:\\pasta" --sem-cabecalho --txt --ocr
+  python limpa_pdf_mpsc.py "C:\\pasta" --sem-cabecalho --md --ocr
 
 Requisitos: pip install pikepdf pdfplumber pypdfium2 pytesseract
             (OCR requer também o programa Tesseract instalado)

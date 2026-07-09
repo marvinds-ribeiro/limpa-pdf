@@ -28,28 +28,45 @@ autorização de componentes (Python, Tesseract) passa pela **COTEC**.
 
 ## 2. Estado atual e arquivos
 
-A lógica de limpeza está madura (~1.549 linhas, validada em produção) e já
-UNIFICADA numa **base única v2.6** (`limpa_pdf_mpsc.py`). O merge dos antigos
-`_PAGINADO` (v2.5, paginação) e `_OCR` (v2.4, OCR de qualidade) JÁ ESTÁ FEITO —
-ver MERGE.md, que agora é registro histórico, não tarefa pendente. A v2.6 tem:
+A lógica de limpeza está madura, validada em produção e UNIFICADA numa **base
+única, hoje v2.8** (`limpa_pdf_mpsc.py`). A GUI PySide6 (`gui.py`) está pronta e
+empacotada (PyInstaller + Inno Setup). A v2.8 tem:
 
+- **Saída SEMPRE em Markdown** (`exportar_md`, substituiu `exportar_txt`): título
+  `# <arquivo>` com metadados (nº do processo `PROC_REGEX`, unidade
+  `UNIDADE_REGEX`, total de páginas), `## Página N de TOTAL` contínuo entre
+  partes, peças processuais como `### <PEÇA>` (`PECA_ROTULOS`, detecção
+  conservadora: linha curta e MAIÚSCULA), tabelas Markdown só quando reais
+  (`TAB_MIN_LINHAS`×`TAB_MIN_COLUNAS` = 2×2). Sem avisos de tabela/imagem
+  (removidos na v2.8 — o conteúdo das imagens agora é extraído).
+- **OCR por REGIÃO de imagem embutida** (`_ocr_imagens_embutidas`): páginas COM
+  texto de corpo e prints/documentos anexados como imagem (prova!) recebem OCR
+  das regiões — texto invisível selecionável no PDF + bloco marcado
+  `[Texto extraído de imagem...]` no .md, com deduplicação tolerante
+  (`_texto_contido`). Filtro `_imagem_candidata_ocr`: `IMG_OCR_FRAC_MIN = 0.02`
+  (exclui o logo, fração 0.014) até `IMG_PAGINA_FRAC = 0.80`, fora da zona de
+  cabeçalho. Páginas manuscritas (`_pagina_manuscrita`): OCR best-effort com
+  banner de baixa confiança.
+- **Divisão por TAMANHO em MB** (`dividir_pdf(caminho, max_mb)`, padrão
+  `MAX_MB_PARTE = 100`): crescer-gravar-medir — mede o tamanho REAL salvo, nunca
+  estima; página que sozinha excede o limite sai inteira com aviso. Nenhuma
+  página se perde.
 - **Paginação contínua** (`numerar_paginas`, rótulo `[Pagina N de TOTAL]` no canto
-  superior direito; `dividir_pdf` retorna `(arquivo, offset)`; `exportar_txt` com
-  `offset` → cabeçalho `===== Pagina N =====` contínuo entre partes). Flag
+  superior direito; `dividir_pdf` retorna `(arquivo, offset)`; `exportar_md` com
+  `offset`/`total` → `## Página N de TOTAL` contínuo entre partes). Flag
   `--sem-numero`.
 - **OCR de alta precisão**: `_preparar_imagem_ocr` (OpenCV/Otsu, fallback Pillow),
   render a **400 DPI** (`OCR_DPI`), `--oem 1 --psm 6`, `_normalizar_ocr`
   (correção ordinal→letra com guardas), e cap de render `OCR_MAX_LADO_PX = 5000`
   para mediabox gigante.
-- **Detecção de camada de texto corrompida** (era pendência): mede fração
-  alfanumérica × controle/PUA; se a página é majoritariamente lixo (sem
-  `/ToUnicode`, PUA), remove a camada podre e força o OCR, em vez de despejar lixo
-  no `.txt`.
+- **Detecção de camada de texto corrompida**: mede fração alfanumérica ×
+  controle/PUA; se a página é majoritariamente lixo (sem `/ToUnicode`, PUA),
+  remove a camada podre e força o OCR, em vez de despejar lixo no `.md`.
 
-Lançadores atuais (`.bat`) — a serem **substituídos pela GUI**, não mantidos:
-`Limpar_PDFs.bat`, `Limpar_PDFs_com_OCR.bat`, `Limpar_PDFs__pasta_separada_.bat`.
-Há também `LEIA-ME.txt` (guia do usuário) e `Proposta_Limpa_PDF_SIG_v2.docx`
-(proposta institucional para a Administração Superior).
+Lançador `.bat` remanescente (`Limpar_PDFs_com_OCR.bat`) — substituído pela GUI
+na distribuição, mantido para uso via linha de comando. `LEIA-ME.txt` e a
+Proposta `.docx` não estão mais no repositório (só os PDFs gerados
+`Limpa_PDF_Manual_do_Usuario.pdf` e `Apresenta LimpaPDF.pdf`).
 
 ---
 
@@ -61,21 +78,28 @@ A GUI deve importar o módulo e chamar estas funções diretamente, **sem** roda
 - `limpa_pdf(origem: Path, destino: Path, sem_cabecalho: bool) -> int`
   Limpeza estrutural (assinatura, carimbo, cabeçalho/rodapé). Retorna nº de
   páginas alteradas.
-- `embutir_ocr(pdf_path: Path, lang: str, cfg: str) -> int`
-  OCR nas páginas SEM camada de texto; insere texto invisível selecionável.
-  Requer `_preparar_ocr()` antes, para obter `(lang, cfg)`.
+- `embutir_ocr(pdf_path: Path, lang: str, cfg: str) -> tuple[int, dict]`
+  OCR nas páginas SEM camada de texto (página inteira) E nas imagens embutidas
+  de páginas COM texto (por região); insere texto invisível selecionável.
+  Retorna `(n_paginas_ocr, info_ocr)`, onde `info_ocr =
+  {pag_0based: {"blocos": [(texto, conf_media)], "manuscrito": bool}}` —
+  repassar a `exportar_md`. Requer `_preparar_ocr()` antes.
 - `numerar_paginas(pdf_path: Path, total: int, inicio: int = 1) -> int`
   Carimbo de paginação contínua. Chamado sobre o PDF INTEIRO, antes de dividir.
-- `dividir_pdf(caminho: Path, max_pag: int) -> list[(Path, offset)]`
-  Divide em partes de até `max_pag`; offset = 1ª página da parte no documento.
-- `exportar_txt(pdf_path, txt_path, avisos=None, offset=1)` — gera o `.txt`.
+- `dividir_pdf(caminho: Path, max_mb: float) -> list[(Path, offset)]`
+  Divide em partes de até `max_mb` MB (tamanho REAL, crescer-gravar-medir);
+  offset = 1ª página da parte no documento. `max_mb <= 0` = não dividir.
+- `exportar_md(pdf_path, md_path, offset=1, total=0, info_ocr=None)` — gera o
+  `.md` estruturado (metadados, `## Página N de TOTAL`, peças, tabelas reais,
+  blocos de OCR de imagem, banner de manuscrito).
 - `_preparar_ocr() -> (lang, cfg)` — localiza Tesseract e idioma português.
-- `_detectar_tabelas_imagens(pdf_path)` — rede de segurança (avisos no `.txt`).
 
 **Ordem do pipeline (replicar o que o `main()` faz hoje):**
-1. `limpa_pdf` → 2. `embutir_ocr` (se OCR ligado) → 3. `numerar_paginas` (se
-paginação ligada, sobre o PDF inteiro) → 4. `dividir_pdf` → 5. para cada parte,
-`_detectar_tabelas_imagens` + `exportar_txt` (se TXT ligado).
+1. `limpa_pdf` → 2. `embutir_ocr` (se OCR ligado; guarda `info_ocr`) →
+3. calcular `total_pag` → 4. `numerar_paginas` (se paginação ligada, sobre o
+PDF inteiro) → 5. `dividir_pdf` → 6. para cada parte,
+`exportar_md(parte, md, offset=offset, total=total_pag, info_ocr=info_ocr)`
+(se .md ligado).
 
 ---
 
@@ -102,6 +126,15 @@ paginação ligada, sobre o PDF inteiro) → 4. `dividir_pdf` → 5. para cada p
   locais antes de tentar baixar — isso é o que garante operação offline.
 - **OCR — stack atual de melhor qualidade:** `tessdata_best` + `--oem 1 --psm 6` +
   render 400 DPI + binarização Otsu + `_normalizar_ocr()`.
+- **Camada invisível de OCR aparece no FIM do texto extraído:** as camadas
+  (OCR de região, carimbo de paginação) são anexadas ao fim do content stream,
+  então a extração (pdfium) as devolve no FIM do corpo da página — na ordem:
+  corpo + OCR de imagem + carimbo. `exportar_md` remove esses sufixos por
+  comparação tolerante a espaços (`_remover_sufixo_tolerante`) para o .md não
+  duplicar; se não casar, mantém (duplicar é aceitável, perder não).
+- **Tesseract NÃO lê manuscrito/cursiva com fidelidade:** o OCR de página
+  manuscrita é best-effort (recupera pistas, não prova fiel) e o .md marca o
+  bloco explicitamente. Não prometer fidelidade.
 
 ---
 
@@ -123,7 +156,8 @@ visualmente) antes de entrar no arquivo principal.
 
 - **Constantes nomeadas em nível de módulo**, nunca números mágicos:
   `OCR_DPI`, `OCR_MAX_LADO_PX`, `OCR_LIMIAR_BIN`, `OCR_BINARIZAR`, `TAB_MIN_LINHAS`,
-  `TAB_MIN_COLUNAS`, `MAX_PAGINAS`, `MAX_PAG_CURTO`, `FAIXA_TOPO_FRAC`,
+  `TAB_MIN_COLUNAS`, `MAX_MB_PARTE`, `DIV_MARGEM_SEGURANCA`, `IMG_OCR_FRAC_MIN`,
+  `MANUSCRITO_MAX_TEXTO`, `MANUSCRITO_FRAC_MIN`, `MAX_PAG_CURTO`, `FAIXA_TOPO_FRAC`,
   `FAIXA_BASE_FRAC`, `ZONA_TOPO`, `ZONA_BASE`, `FRACAO_REPETICAO` etc. Toda
   grandeza ajustável vira constante no topo do módulo, com comentário do efeito.
 - **Versionamento explícito** no docstring do módulo (v2.3 → v2.4 → v2.5 → v2.6),
@@ -178,13 +212,14 @@ ou assistentes de múltiplas telas. O objetivo é substituir o "arrastar PDF par
 
 3. **Opções (aparecem após selecionar a entrada).** Todas com rótulo claro:
    - **OCR** — checkbox "Reconhecer texto de páginas escaneadas (OCR)". Avisar que
-     é mais lento. Padrão: desligado (a maioria dos PDFs do SIG já tem texto).
+     é mais lento. Padrão: **LIGADO** (v2.8 — OCR é essencial à finalidade de
+     extração: sem ele, prints e páginas escaneadas se perdem).
    - **Paginação** — checkbox "Numerar as páginas (recomendado para citar páginas à
      IA)". Padrão: ligado (espelha o comportamento atual; flag inversa `--sem-numero`).
-   - **Dividir PDF** — checkbox "Dividir PDFs grandes em partes" + campo numérico de
-     páginas por arquivo, **pré-preenchido com 150** (`MAX_PAGINAS`). Quando
-     desmarcado, equivale a `--max-paginas 0` (não dividir).
-   - **Gerar .txt** — checkbox "Gerar arquivo de texto (.txt) para colar na IA".
+   - **Dividir PDF** — checkbox "Dividir PDFs grandes em partes de no máximo" +
+     campo numérico em **MB**, **pré-preenchido com 100** (`MAX_MB_PARTE`),
+     mínimo 5. Quando desmarcado, equivale a `--max-mb 0` (não dividir).
+   - **Gerar .md** — checkbox "Gerar arquivo de texto (.md) para colar na IA".
      Padrão: ligado.
    - (Implícito hoje: `--sem-cabecalho` está sempre ligado no fluxo dos `.bat`.
      Manter ligado por padrão; opcionalmente expor como opção avançada.)
@@ -212,10 +247,14 @@ limpa); operação offline; pipeline na ordem da seção 3.
 
 - [x] Merge dos dois scripts numa base v2.6 (OCR de qualidade + paginação).
 - [x] Detecção de camada de texto corrompida antes do OCR (seção 4).
-- [ ] **PRÓXIMO:** Esqueleto da GUI PySide6 (seção 8), com QThread (ver `gui.py`).
-- [ ] Empacotamento PyInstaller + Tesseract embutido + Inno Setup (seção 7).
-- [ ] Proposta formal à COTEC para autorizar Python + Tesseract via ZenWorks.
-- [ ] Inicializar repositório Git (se ainda não estiver).
+- [x] GUI PySide6 (seção 8), com QThread (`gui.py`).
+- [x] Empacotamento PyInstaller + Tesseract embutido + Inno Setup (seção 7).
+- [x] Inicializar repositório Git (privado: github.com/marvinds-ribeiro/limpa-pdf).
+- [x] **v2.8:** saída sempre em .md estruturado; OCR de imagens embutidas
+      (prints/manuscritos); avisos removidos; OCR padrão na GUI; divisão por MB.
+- [ ] Reempacotar o instalador com a v2.8 (PyInstaller + Inno Setup).
+- [ ] Proposta formal à COTEC para autorizar a distribuição via ZenWorks;
+      verificar code signing do `setup.exe`.
 
 ---
 
