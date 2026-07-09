@@ -889,6 +889,29 @@ def _preparar_ocr():
 IMG_EMBUTIDA_FRAC = 0.04   # >= 4% da página = imagem relevante a sinalizar
 IMG_PAGINA_FRAC = 0.80     # >= 80% da página = a própria página é imagem
 
+# --------------------------- exportação em Markdown (v2.8) ------------------
+# A saída de texto é SEMPRE Markdown: título com metadados, "## Página N de
+# TOTAL" por página e "### <peça>" quando uma linha inicia peça processual.
+TAB_MIN_LINHAS = 2     # tabela real tem >= 2 linhas E >= 2 colunas — abaixo
+TAB_MIN_COLUNAS = 2    # disso é o falso positivo do find_tables em prosa
+PECA_MAX_LINHA = 60    # linha candidata a rótulo de peça deve ser CURTA
+# Rótulos que abrem peça processual ("###" no .md). Conservador (CLAUDE.md
+# §5): a linha inteira precisa ser MAIÚSCULA, curta e COMEÇAR com um rótulo;
+# na dúvida, texto corrido nunca vira heading. Estenda aqui quando necessário.
+PECA_ROTULOS = (
+    "DESPACHO", "CERTIDÃO", "CERTIDAO", "PORTARIA", "INFORMAÇÃO",
+    "INFORMACAO", "OFÍCIO", "OFICIO", "PROMOÇÃO", "PROMOCAO",
+    "DECISÃO", "DECISAO", "RELATÓRIO", "RELATORIO", "TERMO DE",
+)
+# Nº de processo do SIG (ex.: 09.2023.00003077-4) e linha da unidade, para o
+# cabeçalho de metadados do .md (ambos opcionais — só entram se detectados).
+PROC_REGEX = re.compile(r"\b\d{2}\.\d{4}\.\d{8}-\d\b")
+UNIDADE_REGEX = re.compile(
+    r"(?im)^[^\n]{0,80}(?:promotoria|procuradoria)[^\n]{0,80}$")
+# Confiança média (0-100) abaixo da qual um bloco de OCR de imagem embutida é
+# marcado no .md como "baixa confiança — conferir no original".
+IMG_OCR_CONF_BAIXA = 60
+
 
 def _detectar_tabelas_imagens(pdf_path: Path):
     """Detecta, página a página, a presença de TABELAS e de IMAGENS EMBUTIDAS
@@ -1031,6 +1054,203 @@ def exportar_txt(pdf_path: Path, txt_path: Path, avisos=None, offset: int = 1):
         )
         corpo = resumo + "\n\n" + corpo
     txt_path.write_text(corpo, encoding="utf-8")
+
+
+def _detectar_peca(linha: str):
+    """Rótulo da peça se a LINHA inicia uma peça processual; senão None.
+    Conservador (CLAUDE.md §5): só linha CURTA, toda MAIÚSCULA e começando
+    com um PECA_ROTULOS seguido de fim/não-letra — prosa nunca vira heading."""
+    s = " ".join((linha or "").split())
+    if not s or len(s) > PECA_MAX_LINHA or s != s.upper():
+        return None
+    for rot in PECA_ROTULOS:
+        if s.startswith(rot):
+            resto = s[len(rot):]
+            if not resto or not resto[0].isalpha():
+                return s
+    return None
+
+
+def _marcar_pecas(texto: str) -> str:
+    """Insere '---' + '### <peça>' nas linhas que iniciam peça processual."""
+    out = []
+    for linha in texto.splitlines():
+        rot = _detectar_peca(linha)
+        if rot:
+            if out and out[-1].strip():
+                out.append("")
+            out += ["---", "", f"### {rot}", ""]
+        else:
+            out.append(linha)
+    return "\n".join(out)
+
+
+def _tabela_para_md(linhas):
+    """Converte a matriz do pdfplumber em tabela Markdown; None se não passar
+    no filtro mínimo TAB_MIN_LINHAS x TAB_MIN_COLUNAS (o find_tables lê
+    espaços de prosa justificada como colunas — falso positivo, CLAUDE.md §4).
+    Fora de tabela validada, o .md NUNCA recebe pipes."""
+    linhas = [l for l in (linhas or []) if l and any(c for c in l)]
+    if len(linhas) < TAB_MIN_LINHAS:
+        return None
+    ncol = max(len(l) for l in linhas)
+    if ncol < TAB_MIN_COLUNAS:
+        return None
+
+    def cel(c):
+        return (" ".join(str(c).split()) if c else "").replace("|", "\\|")
+
+    out = []
+    for i, l in enumerate(linhas):
+        l = list(l) + [None] * (ncol - len(l))
+        out.append("| " + " | ".join(cel(c) for c in l) + " |")
+        if i == 0:
+            out.append("|" + " --- |" * ncol)
+    return "\n".join(out)
+
+
+def _tabelas_md(pdf_path: Path) -> dict:
+    """Tabelas REAIS por página (0-based nesta parte), já em Markdown.
+    Nunca quebra: sem pdfplumber (ou erro), devolve {} silenciosamente."""
+    try:
+        import pdfplumber
+    except Exception:
+        return {}
+    out = {}
+    try:
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            for i, p in enumerate(pdf.pages):
+                try:
+                    mds = [m for m in (_tabela_para_md(t)
+                                       for t in (p.extract_tables() or [])) if m]
+                except Exception:
+                    continue
+                if mds:
+                    out[i] = mds
+    except Exception:
+        return {}
+    return out
+
+
+def _remover_sufixo_tolerante(corpo: str, sufixo: str):
+    """Remove 'sufixo' do FIM de 'corpo', tolerando diferenças de espaçamento
+    (a extração pode trocar espaços por quebras). None se não for sufixo.
+    Usado para não duplicar no .md o texto da camada invisível de OCR de
+    imagem embutida, que a extração devolve no fim do corpo da página."""
+    i, j = len(corpo) - 1, len(sufixo) - 1
+    while True:
+        while i >= 0 and corpo[i].isspace():
+            i -= 1
+        while j >= 0 and sufixo[j].isspace():
+            j -= 1
+        if j < 0:
+            return corpo[:i + 1].rstrip()
+        if i < 0 or corpo[i] != sufixo[j]:
+            return None
+        i -= 1
+        j -= 1
+
+
+def _extrair_paginas(pdf_path: Path):
+    """Texto de cada página (pypdfium2; pdfplumber de reserva) ou None."""
+    try:
+        import pypdfium2 as pdfium
+        doc = pdfium.PdfDocument(str(pdf_path))
+        try:
+            paginas = []
+            for i in range(len(doc)):
+                tp = doc[i].get_textpage()
+                paginas.append((tp.get_text_range() or "").strip())
+                tp.close()
+            return paginas
+        finally:
+            doc.close()
+    except Exception:
+        pass
+    try:
+        import pdfplumber
+        with pdfplumber.open(str(pdf_path)) as pl:
+            return [(p.extract_text() or "").strip() for p in pl.pages]
+    except Exception as e:
+        print(f"   [aviso] .md nao gerado ({e}). Rode no terminal:"
+              "  python -m pip install pypdfium2")
+        return None
+
+
+def _cabecalho_md(pdf_path: Path, paginas, total: int) -> str:
+    """Título do .md: nome do arquivo + metadados detectáveis (nº do processo
+    e unidade, se aparecerem nas 2 primeiras páginas) + total de páginas."""
+    nome = re.sub(r"_parte\d+$", "", pdf_path.stem)
+    amostra = "\n".join(paginas[:2])
+    meta = []
+    m = PROC_REGEX.search(amostra)
+    if m:
+        meta.append(f"**Processo:** {m.group(0)}")
+    m = UNIDADE_REGEX.search(amostra)
+    if m:
+        meta.append(f"**Unidade:** {' '.join(m.group(0).split())}")
+    meta.append(f"**Total de páginas:** {total}")
+    return f"# {nome}\n\n" + " · ".join(meta)
+
+
+def exportar_md(pdf_path: Path, md_path: Path, offset: int = 1,
+                total: int = 0, info_ocr: dict | None = None):
+    """Gera o .md estruturado desta parte do PDF (v2.8; substitui o .txt).
+
+    'offset' é o número (1-based) da 1ª página desta parte no documento
+    inteiro (numeração CONTÍNUA, casando com o carimbo do PDF). 'total' é o
+    total de páginas do documento inteiro (0 = calcula desta parte).
+    'info_ocr' vem de embutir_ocr, indexado por página GLOBAL 0-based:
+    {"blocos": [(texto, conf_media)], "manuscrito": bool} — blocos viram
+    citações marcadas "[Texto extraído de imagem...]"; páginas manuscritas
+    ganham o banner de baixa confiança. Sem avisos de tabela/imagem: o
+    conteúdo das imagens agora é extraído ativamente."""
+    paginas = _extrair_paginas(pdf_path)
+    if paginas is None:
+        return
+    info_ocr = info_ocr or {}
+    if not total:
+        total = offset - 1 + len(paginas)
+    tabelas = _tabelas_md(pdf_path)
+    aviso_sem_texto = ("_(página sem texto aproveitável — ative o OCR, com o"
+                       " Tesseract disponível, para extrair o conteúdo)_")
+
+    saida = [_cabecalho_md(pdf_path, paginas, total)]
+    for i, texto in enumerate(paginas):
+        num = offset + i
+        info = info_ocr.get(offset - 1 + i, {})
+        blocos = info.get("blocos", [])
+        corpo = texto.strip()
+        # A camada invisível do OCR de imagem foi anexada ao FIM do content
+        # stream, então a extração devolve esse texto no fim do corpo; tira-se
+        # o sufixo para o bloco marcado abaixo não duplicar. Se não casar
+        # (extrator reordenou), mantém — duplicar é aceitável, perder não.
+        for btexto, _conf in reversed(blocos):
+            novo = _remover_sufixo_tolerante(corpo, btexto)
+            if novo is not None:
+                corpo = novo
+        if not corpo and not blocos:
+            corpo = aviso_sem_texto
+        elif corpo and not _texto_e_aproveitavel(corpo) and not blocos \
+                and not info.get("manuscrito"):
+            corpo = aviso_sem_texto
+        else:
+            corpo = _marcar_pecas(corpo)
+        sec = [f"## Página {num} de {total}", ""]
+        if info.get("manuscrito"):
+            sec += ["> **[Documento manuscrito — OCR de baixa confiança,"
+                    " revisar no original]**", ""]
+        sec.append(corpo)
+        for t in tabelas.get(i, []):
+            sec += ["", t]
+        for btexto, conf in blocos:
+            sec += ["", f"> **[Texto extraído de imagem na página {num}]**"]
+            sec += ["> " + l for l in btexto.splitlines() if l.strip()]
+            if conf < IMG_OCR_CONF_BAIXA:
+                sec.append("> _(baixa confiança de OCR — conferir no"
+                           " original)_")
+        saida.append("\n".join(sec))
+    md_path.write_text("\n\n".join(saida) + "\n", encoding="utf-8")
 
 
 def _normalizar_ocr(texto: str) -> str:
