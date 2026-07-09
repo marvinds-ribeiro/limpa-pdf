@@ -456,6 +456,9 @@ class JanelaPrincipal(QWidget):
         self.chk_ocr = QCheckBox("Reconhecer texto de páginas escaneadas (OCR) — mais lento")
         self.chk_pag = QCheckBox("Numerar as páginas (recomendado para citar páginas à IA)")
         self.chk_md = QCheckBox("Gerar arquivo de texto (.md) para colar na IA")
+        # OCR ligado por padrão (v2.8): a finalidade do programa é EXTRAIR o
+        # conteúdo para IA — sem OCR, prints e páginas escaneadas se perdem.
+        self.chk_ocr.setChecked(True)
         self.chk_pag.setChecked(True)
         self.chk_md.setChecked(True)
 
