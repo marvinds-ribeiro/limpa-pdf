@@ -274,12 +274,13 @@ class Worker(QThread):
             if self._cancelar:
                 break
 
+            info_ocr = {}
             if lang:
                 msg = f"[{k+1}/{total}] OCR em {arq.name} (pode demorar)..."
                 self.progresso.emit(pct, msg)
                 self.log.emit(msg)
                 try:
-                    core.embutir_ocr(destino, lang, cfg)
+                    _n_ocr, info_ocr = core.embutir_ocr(destino, lang, cfg)
                 except Exception as e:
                     self.log.emit(f"[AVISO] OCR falhou: {e}")
 
@@ -315,7 +316,7 @@ class Worker(QThread):
                     md = parte.with_suffix(".md")
                     try:
                         core.exportar_md(parte, md, offset=offset,
-                                         total=total_pag)
+                                         total=total_pag, info_ocr=info_ocr)
                         if md.is_file():
                             gerados.append(md.name)
                     except Exception as e:

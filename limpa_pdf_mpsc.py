@@ -1147,10 +1147,16 @@ def exportar_md(pdf_path: Path, md_path: Path, offset: int = 1,
         info = info_ocr.get(offset - 1 + i, {})
         blocos = info.get("blocos", [])
         corpo = texto.strip()
-        # A camada invisível do OCR de imagem foi anexada ao FIM do content
-        # stream, então a extração devolve esse texto no fim do corpo; tira-se
-        # o sufixo para o bloco marcado abaixo não duplicar. Se não casar
-        # (extrator reordenou), mantém — duplicar é aceitável, perder não.
+        # O fim do texto extraído é, na ordem do content stream: corpo
+        # original + camada invisível de OCR de imagem + carimbo de paginação
+        # (numerar_paginas roda DEPOIS do OCR). Remove-se do fim: (1) o
+        # carimbo "[Pagina N de TOTAL]" — redundante com o "## Página N" do
+        # cabeçalho —, (2) os blocos de OCR de imagem, para o bloco marcado
+        # abaixo não duplicar. Se não casar (extrator reordenou), mantém —
+        # duplicar é aceitável, perder não.
+        novo = _remover_sufixo_tolerante(corpo, _rotulo_pagina(num, total))
+        if novo is not None:
+            corpo = novo
         for btexto, _conf in reversed(blocos):
             novo = _remover_sufixo_tolerante(corpo, btexto)
             if novo is not None:
@@ -1539,16 +1545,101 @@ def _linhas_texto_ocr(dados, x0, y0, H, sx, sy, dx_px=0.0, dy_px=0.0):
     return linhas, palavras, confs
 
 
-def embutir_ocr(pdf_path: Path, lang: str, cfg: str) -> int:
-    """Acrescenta, nas páginas SEM camada de texto, texto invisível de OCR
-    (Text Rendering Mode 3) POR CIMA do conteúdo, palavra a palavra, para
-    que o texto fique selecionável e pesquisável em qualquer leitor.
+def _pagina_manuscrita(page, existente: str) -> bool:
+    """Página majoritariamente MANUSCRITA (best-effort honesto): quase sem
+    texto de corpo (< MANUSCRITO_MAX_TEXTO chars) e com imagem(ns) de fração
+    >= MANUSCRITO_FRAC_MIN. O OCR roda assim mesmo, mas o Tesseract não lê
+    cursiva com fidelidade — o .md marca o bloco como baixa confiança."""
+    if len((existente or "").strip()) >= MANUSCRITO_MAX_TEXTO:
+        return False
+    els = _elementos(page)
+    if els is None:
+        return False
+    W, H = _grupo(page)
+    area = (W * H) or 1
+    return any(
+        kind in ("I", "II") and bbox and not rot
+        and (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]) / area >= MANUSCRITO_FRAC_MIN
+        for kind, _k, bbox, _i, rot in els)
+
+
+def _ocr_imagens_embutidas(pdf, page, pag_pdfium, lang, cfg_ocr, existente):
+    """OCR por REGIÃO das imagens embutidas de uma página que JÁ tem texto de
+    corpo (prints de WhatsApp, documentos anexados — possível prova que o
+    fluxo de página inteira nunca lia). Para cada imagem candidata (vide
+    _imagem_candidata_ocr): recorta SÓ a região da página renderizada,
+    pré-processa (_preparar_imagem_ocr) e reconhece; o texto vira camada
+    invisível alinhada (mesma matemática da página inteira, deslocada pelo
+    recorte) e um bloco para o .md. Texto já contido no corpo é descartado
+    (_texto_contido) — não duplica nem embute. Nunca quebra: erro em uma
+    região só pula aquela região. Retorna [(texto, conf_media)]."""
+    import pytesseract
+    els = _elementos(page)
+    if els is None:
+        return []
+    W, H = _grupo(page)
+    cands = [bbox for kind, _k, bbox, _ins, rot in els
+             if kind in ("I", "II") and bbox and not rot
+             and _imagem_candidata_ocr(bbox, W, H)]
+    if not cands:
+        return []
+    img = pag_pdfium.render(scale=_escala_render(page)).to_pil()
+    box = page.mediabox
+    mx0, my0 = float(box[0]), float(box[1])
+    Wm, Hm = float(box[2]) - mx0, float(box[3]) - my0
+    sx, sy = Wm / img.width, Hm / img.height
+    linhas_pag, blocos = [], []
+    for bbox in cands:
+        # bbox em pontos (origem inferior-esquerda) -> recorte px (origem sup.)
+        cx0 = max(0, int((bbox[0] - mx0) / sx))
+        cx1 = min(img.width, int(math.ceil((bbox[2] - mx0) / sx)))
+        cy0 = max(0, int((Hm - (bbox[3] - my0)) / sy))
+        cy1 = min(img.height, int(math.ceil((Hm - (bbox[1] - my0)) / sy)))
+        if cx1 - cx0 < 8 or cy1 - cy0 < 8:
+            continue
+        rec = _preparar_imagem_ocr(img.crop((cx0, cy0, cx1, cy1)))
+        try:
+            dados = pytesseract.image_to_data(
+                rec, lang=lang, config=cfg_ocr,
+                output_type=pytesseract.Output.DICT)
+        except Exception:
+            continue
+        linhas, palavras, confs = _linhas_texto_ocr(
+            dados, mx0, my0, Hm, sx, sy, dx_px=cx0, dy_px=cy0)
+        texto = " ".join(palavras).strip()
+        if not texto:
+            continue
+        if _texto_contido(texto, existente):
+            continue  # já está no corpo: não duplica (nem embute)
+        linhas_pag += linhas
+        blocos.append((texto, sum(confs) / len(confs)))
+    if linhas_pag:
+        m_inv = _inverter_matriz(_ctm_residual(page)) or I
+        camada = ([b"q",
+                   ("%.6f %.6f %.6f %.6f %.4f %.4f cm" % m_inv)
+                   .encode("latin-1"),
+                   b"BT", b"3 Tr"] + linhas_pag + [b"ET", b"Q"])
+        _garantir_fonte(pdf, page, "/FOCR")
+        page.contents_add(pdf.make_stream(b"\n".join(camada)), prepend=False)
+    return blocos
+
+
+def embutir_ocr(pdf_path: Path, lang: str, cfg: str):
+    """Acrescenta texto invisível de OCR (Text Rendering Mode 3) POR CIMA do
+    conteúdo, palavra a palavra, para que o texto fique selecionável e
+    pesquisável em qualquer leitor:
+      - páginas SEM texto aproveitável: OCR da página inteira (como sempre);
+      - páginas COM texto de corpo: OCR por REGIÃO das imagens embutidas
+        (prints, documentos anexados — v2.8, vide _ocr_imagens_embutidas).
 
     A camada é desenhada com o CTM herdado do conteúdo neutralizado, em
     coordenadas absolutas de página, com tamanho de fonte e escala horizontal
     ajustados a cada palavra — de modo que o texto invisível coincida com as
     palavras da imagem (a seleção do mouse "casa" com o que se vê).
-    Retorna o nº de páginas ocerizadas."""
+
+    Retorna (n_paginas_ocr, info_ocr). info_ocr é consumido por exportar_md:
+    {pagina_0based: {"blocos": [(texto, conf_media)], "manuscrito": bool}} —
+    só páginas com algo a registrar entram no dict."""
     import pypdfium2 as pdfium
     import pytesseract
 
@@ -1560,17 +1651,37 @@ def embutir_ocr(pdf_path: Path, lang: str, cfg: str) -> int:
     pdf = pikepdf.open(pdf_path, allow_overwriting_input=True)
     doc = pdfium.PdfDocument(str(pdf_path))
     n_ocr = 0
+    info = {}
     try:
         for i, page in enumerate(pdf.pages):
             tp = doc[i].get_textpage()
             existente = (tp.get_text_range() or "").strip()
             tp.close()
+            manuscrito = _pagina_manuscrita(page, existente)
             # Antes: pulava o OCR sempre que len>=20. Problema: páginas com
             # camada de texto CORROMPIDA (fonte sem /ToUnicode) têm len grande
-            # mas o conteúdo é lixo (controle/PUA) — e o lixo ia parar no .txt.
-            # Agora só pulamos se o texto for REALMENTE aproveitável.
+            # mas o conteúdo é lixo (controle/PUA) — e o lixo ia parar no .md.
+            # Agora só pulamos o OCR de página inteira se o texto for
+            # REALMENTE aproveitável — e mesmo assim as IMAGENS EMBUTIDAS da
+            # página passam por OCR de região (v2.8): prints e documentos
+            # anexados são possível prova e nunca eram lidos.
             if _texto_e_aproveitavel(existente):
+                try:
+                    blocos = _ocr_imagens_embutidas(
+                        pdf, page, doc[i], lang, cfg_ocr, existente)
+                except Exception as e:
+                    print(f"   [aviso] OCR de imagens da pag {i + 1}"
+                          f" falhou: {e}")
+                    blocos = []
+                if blocos:
+                    print(f"   OCR de imagem embutida na pagina {i + 1}"
+                          f" ({len(blocos)} bloco(s))...", flush=True)
+                    n_ocr += 1
+                if blocos or manuscrito:
+                    info[i] = {"blocos": blocos, "manuscrito": manuscrito}
                 continue
+            if manuscrito:
+                info[i] = {"blocos": [], "manuscrito": True}
             # Página sem texto OU com camada podre: se havia camada podre,
             # removemo-la antes de sobrepor o OCR (senão a extração continuaria
             # pegando o lixo em vez do texto do OCR).
@@ -1624,7 +1735,7 @@ def embutir_ocr(pdf_path: Path, lang: str, cfg: str) -> int:
         if doc is not None:
             doc.close()
         pdf.close()
-    return n_ocr
+    return n_ocr, info
 
 
 # --------------------------- PAGINAÇÃO CONTÍNUA -----------------------------
@@ -1799,9 +1910,10 @@ def main():
         except Exception as e:
             print(f"[ERRO] {arq.name}: {e}")
             continue
+        info_ocr = {}
         if lang:
             try:
-                n_ocr = embutir_ocr(destino, lang, cfg)
+                n_ocr, info_ocr = embutir_ocr(destino, lang, cfg)
                 if n_ocr:
                     print(f"   OCR embutido em {n_ocr} páginas (texto"
                           " selecionável).")
@@ -1836,7 +1948,8 @@ def main():
             if args.md:
                 md = parte.with_suffix(".md")
                 try:
-                    exportar_md(parte, md, offset=offset, total=total_pag)
+                    exportar_md(parte, md, offset=offset, total=total_pag,
+                                info_ocr=info_ocr)
                     if md.is_file():
                         nomes.append(md.name)
                 except Exception as e:

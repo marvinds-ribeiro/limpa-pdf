@@ -1,5 +1,13 @@
 """Testes do OCR por região de imagem embutida (v2.8) — filtro, dedup, camada."""
+import shutil
+from pathlib import Path
+
+import pytest
+
 import limpa_pdf_mpsc as core
+
+RAIZ = Path(__file__).resolve().parent.parent
+EXEMPLO1 = RAIZ / "exemplo 1.pdf"
 
 W, H = 612.0, 792.0
 
@@ -50,3 +58,27 @@ def test_linhas_texto_ocr_com_deslocamento():
     dados["conf"] = ["30"]
     l2, p2, _ = core._linhas_texto_ocr(dados, 0, 0, 792.0, 0.18, 0.18)
     assert not l2 and not p2
+
+
+def _tem_tesseract():
+    lang, _ = core._preparar_ocr()
+    return bool(lang)
+
+
+@pytest.mark.skipif(not EXEMPLO1.is_file(), reason="exemplo 1.pdf ausente")
+def test_ocr_regiao_exemplo1(tmp_path):
+    if not _tem_tesseract():
+        pytest.skip("Tesseract indisponível")
+    alvo = tmp_path / "ex1.pdf"
+    shutil.copy(EXEMPLO1, alvo)
+    lang, cfg = core._preparar_ocr()
+    n_ocr, info = core.embutir_ocr(alvo, lang, cfg)
+    # a página tem 1607 chars de corpo + 6 imagens (prints): antes passava
+    # batido; agora deve produzir blocos de OCR de imagem
+    assert isinstance(info, dict)
+    assert any(v["blocos"] for v in info.values()), \
+        "nenhum texto extraído dos prints do exemplo 1"
+    # e o texto embutido fica extraível no PDF (seleção)
+    paginas = core._extrair_paginas(alvo)
+    bloco0 = info[0]["blocos"][0][0]
+    assert core._texto_contido(bloco0, paginas[0])
