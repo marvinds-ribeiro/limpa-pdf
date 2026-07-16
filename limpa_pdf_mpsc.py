@@ -46,6 +46,26 @@ Novidades da v2.9:
     A assinatura digital (rotacionada/vetorizada/tarja), o carimbo CÓPIA e a
     remoção de cabeçalho/rodapé verdadeiros continuam EXATAMENTE como antes
     (regressão automatizada em tests/regressao/verificar_regressao.py).
+  - OCR EM PARALELO POR PÁGINA (medido em perfil.py/PERFIL_*.md: o Tesseract
+    era 85% do tempo de OCR, um processo por página, sequencial):
+    ProcessPoolExecutor com OCR_WORKERS processos (0 = automático:
+    núcleos-1 com teto por RAM; --workers na CLI e na GUI), OMP_THREAD_LIMIT=1
+    por worker, worker no nível do módulo (Windows/spawn) e
+    multiprocessing.freeze_support() no main (obrigatório no exe congelado).
+    O resultado por página é IDÊNTICO ao sequencial (validado bit a bit);
+    páginas em branco pulam o Tesseract (O4). O render em tons de cinza (O3)
+    e o Otsu em cópia reduzida (O2) foram REPROVADOS/descartados no portão de
+    qualidade (portao_qualidade.py) — qualidade nunca se troca por
+    velocidade.
+  - EXPORTAÇÃO SEM pdfplumber DESNECESSÁRIO (O5): find_tables (pdfminer) era
+    ~99% do tempo do .md varrendo páginas escaneadas; agora só roda nas
+    páginas onde uma varredura barata do parse pikepdf (_paginas_com_grade,
+    grade traçada >= 3x3 linhas) indica tabela possível — a saída é idêntica.
+  - PROGRESSO E CANCELAMENTO (Tarefa B): as funções pesadas aceitam
+    progresso(etapa, feito, total, detalhe) e cancelar (threading.Event);
+    planejar() conta páginas e páginas de OCR (orçamento exato p/ barra
+    honesta, pesos P_* medidos no perfil). Cancelado, NADA fica pela metade:
+    toda função grava só ao final.
 
 Novidades da v2.8:
   - SAÍDA SEMPRE EM MARKDOWN (.md): título com metadados (nº do processo,
@@ -490,7 +510,7 @@ def _regua_caixa(bbox, verticais):
     return True
 
 
-def zonas_tabela(els, W, H):
+def zonas_tabela(els, W, H, so_tracadas=False, min_h=2, min_v=2):
     """Zonas de TABELA/CAIXA da página (C1 — território protegido).
 
     Reaproveita os elementos já parseados pelo pikepdf (sem pdfplumber):
@@ -500,7 +520,14 @@ def zonas_tabela(els, W, H):
     horizontais E >= 2 verticais (o filtro mínimo 2x2 que evita falso
     positivo com texto justificado). Retângulo cobrindo quase a página toda
     (>= TAB_RECT_MAX_FRAC) é moldura de página, não tabela. Devolve a lista
-    de bboxes das zonas."""
+    de bboxes das zonas.
+
+    'so_tracadas=True' considera apenas linhas TRAÇADAS (stroke) — o modo do
+    gate do pdfplumber (O5): em páginas de texto vetorizado do SIG, glifos
+    preenchidos de poucos pontos ("l", "1", "-") viram falsas "linhas" e
+    quase toda página ganharia zona. Para a PROTEÇÃO (C1) o padrão continua
+    incluindo linhas preenchidas finas: falso positivo lá só protege a mais
+    (conservador, CLAUDE.md §5)."""
     horiz, vert = [], []
     area_pag = (W * H) or 1
     for kind, key, bbox, _ins, rot in els:
@@ -508,7 +535,7 @@ def zonas_tabela(els, W, H):
             continue
         w = bbox[2] - bbox[0]; h = bbox[3] - bbox[1]
         tracado = str(key[-1]) in ("S", "s", "B", "B*", "b", "b*")
-        if not (tracado or key[5] <= 6):
+        if not (tracado or (key[5] <= 6 and not so_tracadas)):
             continue  # glifo vetorizado/desenho: não é linha de grade
         if h <= TAB_LINHA_FINA and w >= TAB_LINHA_H_MIN:
             horiz.append(bbox)
@@ -553,7 +580,7 @@ def zonas_tabela(els, W, H):
         u = g[2]
         g[2] = b if u is None else (min(u[0], b[0]), min(u[1], b[1]),
                                     max(u[2], b[2]), max(u[3], b[3]))
-    return [g[2] for g in grupos.values() if g[0] >= 2 and g[1] >= 2]
+    return [g[2] for g in grupos.values() if g[0] >= min_h and g[1] >= min_v]
 
 
 def _centro_em_zonas(bbox, zonas):
@@ -683,13 +710,18 @@ def _faixa_assinatura_vetorial(els, W, H):
     return (min(densas) - 6, max(densas) + LARG_COL + 6)
 
 
-def analisar(pdf):
-    """Pass A (1 leitura por página). Vide reescrever() para o uso."""
+def analisar(pdf, progresso=None):
+    """Pass A (1 leitura por página). Vide reescrever() para o uso.
+    'progresso' (v2.9/B): callable opcional progresso(etapa, feito, total,
+    detalhe) — o núcleo NÃO conhece Qt; a GUI adapta para sinal."""
     contagem = defaultdict(set)
     zonas = {}
     tam_grupo = defaultdict(int)
     reguas = defaultdict(lambda: defaultdict(list))
+    n_total = len(pdf.pages)
     for i, page in enumerate(pdf.pages):
+        if progresso:
+            progresso("analise", i + 1, n_total, f"página {i + 1}")
         g = _grupo(page)
         tam_grupo[g] += 1
         W, H = g
@@ -1338,9 +1370,45 @@ def _tabela_para_md(linhas):
     return "\n".join(out)
 
 
+def _paginas_com_grade(pdf_path: Path):
+    """Páginas (0-based) que têm GRADE vetorial (>= 2 linhas H e >= 2 V
+    conectadas — vide zonas_tabela), ou seja: as únicas onde o find_tables
+    do pdfplumber (estratégia de linhas) pode achar tabela real.
+
+    v2.9/O5: o pdfplumber usa pdfminer, ordens de grandeza mais lento que o
+    parse do pikepdf que já fazemos — no perfil, 125 s dos 127 s da
+    exportação eram find_tables varrendo páginas ESCANEADAS sem nenhuma
+    linha vetorial. Esta varredura barata restringe o pdfplumber às páginas
+    com grade. Nunca quebra: erro -> None (pdfplumber roda em todas)."""
+    try:
+        out = set()
+        with pikepdf.open(pdf_path) as pdf:
+            for i, page in enumerate(pdf.pages):
+                els = _elementos(page)
+                if els is None:
+                    out.add(i)   # não deu para analisar: na dúvida, verifica
+                    continue
+                W, H = _grupo(page)
+                # >= 3 linhas em cada direção: uma CAIXA simples (2H+2V, uma
+                # célula só) nunca passa no filtro TAB_MIN 2x2 do
+                # _tabela_para_md — rodar o pdfplumber nela é custo puro.
+                if zonas_tabela(els, W, H, so_tracadas=True,
+                                min_h=3, min_v=3):
+                    out.add(i)
+        return out
+    except Exception:
+        return None
+
+
 def _tabelas_md(pdf_path: Path) -> dict:
     """Tabelas REAIS por página (0-based nesta parte), já em Markdown.
-    Nunca quebra: sem pdfplumber (ou erro), devolve {} silenciosamente."""
+    Nunca quebra: sem pdfplumber (ou erro), devolve {} silenciosamente.
+    v2.9/O5: o pdfplumber só é aberto/rodado nas páginas com grade vetorial
+    (_paginas_com_grade) — a saída é a mesma, sem o custo do pdfminer em
+    páginas escaneadas/sem tabela."""
+    grade = _paginas_com_grade(pdf_path)
+    if grade is not None and not grade:
+        return {}
     try:
         import pdfplumber
     except Exception:
@@ -1349,6 +1417,8 @@ def _tabelas_md(pdf_path: Path) -> dict:
     try:
         with pdfplumber.open(str(pdf_path)) as pdf:
             for i, p in enumerate(pdf.pages):
+                if grade is not None and i not in grade:
+                    continue
                 try:
                     mds = [m for m in (_tabela_para_md(t)
                                        for t in (p.extract_tables() or [])) if m]
@@ -1423,7 +1493,8 @@ def _cabecalho_md(pdf_path: Path, paginas, total: int) -> str:
 
 
 def exportar_md(pdf_path: Path, md_path: Path, offset: int = 1,
-                total: int = 0, info_ocr: dict | None = None):
+                total: int = 0, info_ocr: dict | None = None,
+                progresso=None, cancelar=None):
     """Gera o .md estruturado desta parte do PDF (v2.8; substitui o .txt).
 
     'offset' é o número (1-based) da 1ª página desta parte no documento
@@ -1446,6 +1517,10 @@ def exportar_md(pdf_path: Path, md_path: Path, offset: int = 1,
 
     saida = [_cabecalho_md(pdf_path, paginas, total)]
     for i, texto in enumerate(paginas):
+        if cancelar is not None and cancelar.is_set():
+            return   # sem gravar: nunca fica .md pela metade
+        if progresso:
+            progresso("exportacao", i + 1, len(paginas), f"página {offset + i}")
         num = offset + i
         info = info_ocr.get(offset - 1 + i, {})
         blocos = info.get("blocos", [])
@@ -1604,6 +1679,22 @@ OCR_LIMIAR_BIN = 160
 # Liga/desliga a binarização. Em raros documentos já muito limpos ela pode
 # atrapalhar; deixe True para o acervo do SIG (fonte cinza serrilhada).
 OCR_BINARIZAR = True
+
+# --- Desempenho do OCR (v2.9, Tarefa C — decidido por MEDIÇÃO) --------------
+# PERFIL_ANTES.md: image_to_data = 85% do tempo de OCR (um processo Tesseract
+# por página, sequencial). O ganho vem de paralelizar por página (O1); o
+# bilateralFilter, suspeito nº 1 do prompt, mediu só 1,6 s em 261 s (0,6%) e
+# foi mantido como está (qualquer risco de qualidade é veto — C.0).
+OCR_WORKERS = 0          # nº de processos de OCR; 0 = automático
+                         # (min(núcleos-1, RAM_GB//2), mínimo 1)
+OCR_RENDER_CINZA = False # O3 (render direto em cinza) foi REPROVADO no
+                         # portão de qualidade: 99,61% dos chars (< 99,9%)
+                         # com divergências reais em scans degradados — o
+                         # antialiasing do render RGB->L difere do render L.
+                         # Mantido o caminho RGB da v2.8. NÃO ligar sem
+                         # repassar o portão (portao_qualidade.py).
+OCR_BRANCO_LIMIAR = 128  # página/região binarizada SEM nenhum pixel abaixo
+                         # disso está em branco: pula o Tesseract (O4)
 
 # --- Detecção de camada de texto CORROMPIDA (força OCR) ---------------------
 # Alguns PDFs do SIG trazem uma "camada de texto" que NÃO é texto legível: a
@@ -1848,17 +1939,15 @@ def _linhas_texto_ocr(dados, x0, y0, H, sx, sy, dx_px=0.0, dy_px=0.0):
     return linhas, palavras, confs
 
 
-def _pagina_manuscrita(page, existente: str) -> bool:
+def _pagina_manuscrita_els(els, W, H, existente: str) -> bool:
     """Página majoritariamente MANUSCRITA (best-effort honesto): quase sem
     texto de corpo (< MANUSCRITO_MAX_TEXTO chars) e com imagem(ns) de fração
     >= MANUSCRITO_FRAC_MIN. O OCR roda assim mesmo, mas o Tesseract não lê
     cursiva com fidelidade — o .md marca o bloco como baixa confiança."""
     if len((existente or "").strip()) >= MANUSCRITO_MAX_TEXTO:
         return False
-    els = _elementos(page)
     if els is None:
         return False
-    W, H = _grupo(page)
     area = (W * H) or 1
     return any(
         kind in ("I", "II") and bbox and not rot
@@ -1866,33 +1955,114 @@ def _pagina_manuscrita(page, existente: str) -> bool:
         for kind, _k, bbox, _i, rot in els)
 
 
-def _ocr_imagens_embutidas(pdf, page, pag_pdfium, lang, cfg_ocr, existente):
-    """OCR por REGIÃO das imagens embutidas de uma página que JÁ tem texto de
-    corpo (prints de WhatsApp, documentos anexados — possível prova que o
-    fluxo de página inteira nunca lia). Para cada imagem candidata (vide
-    _imagem_candidata_ocr): recorta SÓ a região da página renderizada,
-    pré-processa (_preparar_imagem_ocr) e reconhece; o texto vira camada
-    invisível alinhada (mesma matemática da página inteira, deslocada pelo
-    recorte) e um bloco para o .md. Texto já contido no corpo é descartado
-    (_texto_contido) — não duplica nem embute. Nunca quebra: erro em uma
-    região só pula aquela região. Retorna [(texto, conf_media)]."""
-    import pytesseract
-    els = _elementos(page)
-    if els is None:
-        return []
+def _pagina_manuscrita(page, existente: str) -> bool:
+    """Compatibilidade: idem _pagina_manuscrita_els, parseando a página."""
     W, H = _grupo(page)
-    cands = [bbox for kind, _k, bbox, _ins, rot in els
-             if kind in ("I", "II") and bbox and not rot
-             and _imagem_candidata_ocr(bbox, W, H)]
-    if not cands:
-        return []
-    img = pag_pdfium.render(scale=_escala_render(page)).to_pil()
-    box = page.mediabox
-    mx0, my0 = float(box[0]), float(box[1])
-    Wm, Hm = float(box[2]) - mx0, float(box[3]) - my0
+    return _pagina_manuscrita_els(_elementos(page), W, H, existente)
+
+
+# ---------------- OCR em paralelo por página (v2.9 — O1) ---------------------
+# O trabalho pesado (renderizar + pré-processar + Tesseract) é 100% isolável
+# por página e não toca em objetos pikepdf (não serializáveis): cada worker
+# abre seu próprio handle pypdfium2 do arquivo e devolve o dict do
+# image_to_data + geometria. A montagem da camada invisível continua no
+# processo PAI. O resultado por página é o mesmo do fluxo sequencial — muda
+# só a ordem em que ficam prontos (ex.map preserva a ordem de entrega).
+# OMP_THREAD_LIMIT=1 em cada worker: o Tesseract com OpenMP multi-thread é
+# mais lento e atrapalharia o paralelismo por processo.
+
+_OCR_W = {}   # estado por worker (handle pypdfium2 aberto preguiçosamente)
+
+
+def _ocr_workers_auto(pedido=0) -> int:
+    """Nº de processos de OCR: o pedido, ou automático com teto por RAM
+    (cada worker segura uma imagem de ~15 MP + um motor LSTM)."""
+    import os
+    if pedido and pedido > 0:
+        return int(pedido)
+    cpu = os.cpu_count() or 1
+    ram_gb = 8.0
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class _MEM(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong),
+                            ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong),
+                            ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong),
+                            ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong),
+                            ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            m = _MEM(); m.dwLength = ctypes.sizeof(_MEM)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+                ram_gb = m.ullTotalPhys / (1024 ** 3)
+    except Exception:
+        pass
+    return max(1, min(cpu - 1, int(ram_gb // 2)))
+
+
+def _ocr_worker_init(caminho_pdf, tesseract_cmd, tessdata_prefix):
+    """Inicializador de cada processo worker (Windows usa spawn: o estado do
+    processo pai — tesseract_cmd, TESSDATA_PREFIX — precisa ser reposto)."""
+    import os
+    os.environ["OMP_THREAD_LIMIT"] = "1"
+    if tessdata_prefix:
+        os.environ["TESSDATA_PREFIX"] = tessdata_prefix
+    if tesseract_cmd:
+        try:
+            import pytesseract
+            pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+        except Exception:
+            pass
+    _OCR_W["caminho"] = caminho_pdf
+    _OCR_W["doc"] = None
+
+
+def _ocr_render_pagina(pag, escala):
+    """Render da página p/ OCR; em cinza direto quando OCR_RENDER_CINZA (O3:
+    1 byte/pixel em todas as cópias intermediárias em vez de 3)."""
+    if OCR_RENDER_CINZA:
+        return pag.render(scale=escala, grayscale=True).to_pil()
+    return pag.render(scale=escala).to_pil()
+
+
+def _imagem_em_branco(img_bin) -> bool:
+    """True se a imagem binarizada não tem NENHUM pixel de tinta (O4): folha
+    separadora/região vazia — nada para o Tesseract ler."""
+    try:
+        import numpy as np
+        return int(np.asarray(img_bin).min()) >= OCR_BRANCO_LIMIAR
+    except Exception:
+        return False
+
+
+def _ocr_executar_tarefa(doc, tarefa, lang, cfg_ocr):
+    """Executa UMA tarefa de OCR (worker ou inline) e devolve um resultado
+    picklável — nada de objetos pikepdf/PIL atravessando processos.
+
+    tarefa: {"idx", "escala", "modo": "pagina"|"regioes",
+             "mediabox": (mx0, my0, Wm, Hm), "cands": [bbox, ...]}"""
+    import pytesseract
+    idx = tarefa["idx"]
+    img = _ocr_render_pagina(doc[idx], tarefa["escala"])
+    if tarefa["modo"] == "pagina":
+        img_ocr = _preparar_imagem_ocr(img)
+        if _imagem_em_branco(img_ocr):
+            dados = None      # página em branco: pula o Tesseract (O4)
+        else:
+            dados = pytesseract.image_to_data(
+                img_ocr, lang=lang, config=cfg_ocr,
+                output_type=pytesseract.Output.DICT)
+        return {"idx": idx, "modo": "pagina", "dados": dados,
+                "px": (img.width, img.height)}
+    # modo "regioes": recorta cada imagem candidata e reconhece só a região
+    mx0, my0, Wm, Hm = tarefa["mediabox"]
     sx, sy = Wm / img.width, Hm / img.height
-    linhas_pag, blocos = [], []
-    for bbox in cands:
+    regs = []
+    for bbox in tarefa["cands"]:
         # bbox em pontos (origem inferior-esquerda) -> recorte px (origem sup.)
         cx0 = max(0, int((bbox[0] - mx0) / sx))
         cx1 = min(img.width, int(math.ceil((bbox[2] - mx0) / sx)))
@@ -1901,48 +2071,60 @@ def _ocr_imagens_embutidas(pdf, page, pag_pdfium, lang, cfg_ocr, existente):
         if cx1 - cx0 < 8 or cy1 - cy0 < 8:
             continue
         rec = _preparar_imagem_ocr(img.crop((cx0, cy0, cx1, cy1)))
+        if _imagem_em_branco(rec):
+            continue
         try:
             dados = pytesseract.image_to_data(
                 rec, lang=lang, config=cfg_ocr,
                 output_type=pytesseract.Output.DICT)
         except Exception:
-            continue
-        linhas, palavras, confs = _linhas_texto_ocr(
-            dados, mx0, my0, Hm, sx, sy, dx_px=cx0, dy_px=cy0)
-        texto = " ".join(palavras).strip()
-        if not texto:
-            continue
-        if _texto_contido(texto, existente):
-            continue  # já está no corpo: não duplica (nem embute)
-        linhas_pag += linhas
-        blocos.append((texto, sum(confs) / len(confs)))
-    if linhas_pag:
-        m_inv = _inverter_matriz(_ctm_residual(page)) or I
-        camada = ([b"q",
-                   ("%.6f %.6f %.6f %.6f %.4f %.4f cm" % m_inv)
-                   .encode("latin-1"),
-                   b"BT", b"3 Tr"] + linhas_pag + [b"ET", b"Q"])
-        _garantir_fonte(pdf, page, "/FOCR")
-        page.contents_add(pdf.make_stream(b"\n".join(camada)), prepend=False)
-    return blocos
+            continue  # erro em uma região só pula aquela região
+        regs.append({"dados": dados, "cx0": cx0, "cy0": cy0})
+    return {"idx": idx, "modo": "regioes", "regs": regs,
+            "px": (img.width, img.height)}
 
 
-def embutir_ocr(pdf_path: Path, lang: str, cfg: str):
+def _ocr_worker(args):
+    """Corpo do worker (nível de módulo: o Windows usa spawn)."""
+    tarefa, lang, cfg_ocr = args
+    if _OCR_W.get("doc") is None:
+        import pypdfium2 as pdfium
+        _OCR_W["doc"] = pdfium.PdfDocument(_OCR_W["caminho"])
+    return _ocr_executar_tarefa(_OCR_W["doc"], tarefa, lang, cfg_ocr)
+
+
+def _ocr_camada(pdf, page, linhas_texto):
+    """Anexa a camada de texto invisível (Tr 3) com o CTM herdado
+    neutralizado (vide _ctm_residual) — a matemática da v2.3+."""
+    m_inv = _inverter_matriz(_ctm_residual(page)) or I
+    camada = ([b"q",
+               ("%.6f %.6f %.6f %.6f %.4f %.4f cm" % m_inv).encode("latin-1"),
+               b"BT", b"3 Tr"] + linhas_texto + [b"ET", b"Q"])
+    _garantir_fonte(pdf, page, "/FOCR")
+    page.contents_add(pdf.make_stream(b"\n".join(camada)), prepend=False)
+
+
+def embutir_ocr(pdf_path: Path, lang: str, cfg: str, workers: int = None,
+                progresso=None, cancelar=None):
     """Acrescenta texto invisível de OCR (Text Rendering Mode 3) POR CIMA do
     conteúdo, palavra a palavra, para que o texto fique selecionável e
     pesquisável em qualquer leitor:
       - páginas SEM texto aproveitável: OCR da página inteira (como sempre);
       - páginas COM texto de corpo: OCR por REGIÃO das imagens embutidas
-        (prints, documentos anexados — v2.8, vide _ocr_imagens_embutidas).
+        (prints, documentos anexados — v2.8).
 
-    A camada é desenhada com o CTM herdado do conteúdo neutralizado, em
-    coordenadas absolutas de página, com tamanho de fonte e escala horizontal
-    ajustados a cada palavra — de modo que o texto invisível coincida com as
-    palavras da imagem (a seleção do mouse "casa" com o que se vê).
+    v2.9 (Tarefa C): o trabalho por página roda em PARALELO num
+    ProcessPoolExecutor (vide _ocr_worker; 'workers' = nº de processos,
+    None/0 = automático). A montagem da camada invisível continua aqui no
+    processo pai (objetos pikepdf não são serializáveis). 'progresso' é um
+    callable opcional progresso(etapa, feito, total, detalhe); 'cancelar' é
+    um threading.Event opcional — quando setado, interrompe entre páginas
+    SEM salvar (o arquivo fica como estava).
 
     Retorna (n_paginas_ocr, info_ocr). info_ocr é consumido por exportar_md:
     {pagina_0based: {"blocos": [(texto, conf_media)], "manuscrito": bool}} —
     só páginas com algo a registrar entram no dict."""
+    import os
     import pypdfium2 as pdfium
     import pytesseract
 
@@ -1955,39 +2137,42 @@ def embutir_ocr(pdf_path: Path, lang: str, cfg: str):
     doc = pdfium.PdfDocument(str(pdf_path))
     n_ocr = 0
     info = {}
+    cancelado = False
     try:
+        # ---------- pré-passagem (pai): decide o que cada página precisa ----
+        tarefas = []
+        existentes = {}
+        manuscritos = {}
         for i, page in enumerate(pdf.pages):
             tp = doc[i].get_textpage()
             existente = (tp.get_text_range() or "").strip()
             tp.close()
-            manuscrito = _pagina_manuscrita(page, existente)
-            # Antes: pulava o OCR sempre que len>=20. Problema: páginas com
-            # camada de texto CORROMPIDA (fonte sem /ToUnicode) têm len grande
-            # mas o conteúdo é lixo (controle/PUA) — e o lixo ia parar no .md.
-            # Agora só pulamos o OCR de página inteira se o texto for
-            # REALMENTE aproveitável — e mesmo assim as IMAGENS EMBUTIDAS da
-            # página passam por OCR de região (v2.8): prints e documentos
-            # anexados são possível prova e nunca eram lidos.
+            existentes[i] = existente
+            els = _elementos(page)
+            W, H = _grupo(page)
+            manuscrito = _pagina_manuscrita_els(els, W, H, existente)
+            manuscritos[i] = manuscrito
+            box = page.mediabox
+            mx0, my0 = float(box[0]), float(box[1])
+            mediabox = (mx0, my0, float(box[2]) - mx0, float(box[3]) - my0)
+            # Página com texto REALMENTE aproveitável: só as imagens embutidas
+            # (prints, anexos) passam por OCR de região. Caso contrário, OCR
+            # de página inteira — removendo antes a camada de texto podre
+            # (fonte sem /ToUnicode), senão a extração continuaria pegando o
+            # lixo em vez do texto do OCR.
             if _texto_e_aproveitavel(existente):
-                try:
-                    blocos = _ocr_imagens_embutidas(
-                        pdf, page, doc[i], lang, cfg_ocr, existente)
-                except Exception as e:
-                    print(f"   [aviso] OCR de imagens da pag {i + 1}"
-                          f" falhou: {e}")
-                    blocos = []
-                if blocos:
-                    print(f"   OCR de imagem embutida na pagina {i + 1}"
-                          f" ({len(blocos)} bloco(s))...", flush=True)
-                    n_ocr += 1
-                if blocos or manuscrito:
-                    info[i] = {"blocos": blocos, "manuscrito": manuscrito}
+                cands = [bbox for kind, _k, bbox, _ins, rot in (els or [])
+                         if kind in ("I", "II") and bbox and not rot
+                         and _imagem_candidata_ocr(bbox, W, H)]
+                if cands:
+                    tarefas.append({"idx": i, "modo": "regioes",
+                                    "escala": _escala_render(page),
+                                    "mediabox": mediabox, "cands": cands})
+                elif manuscrito:
+                    info[i] = {"blocos": [], "manuscrito": True}
                 continue
             if manuscrito:
                 info[i] = {"blocos": [], "manuscrito": True}
-            # Página sem texto OU com camada podre: se havia camada podre,
-            # removemo-la antes de sobrepor o OCR (senão a extração continuaria
-            # pegando o lixo em vez do texto do OCR).
             if len(existente) >= OCR_MIN_CHARS_AVAL:
                 try:
                     if _remover_camada_texto(pdf, page):
@@ -1996,41 +2181,92 @@ def embutir_ocr(pdf_path: Path, lang: str, cfg: str):
                 except Exception as e:
                     print(f"   [aviso] nao removi a camada podre da pag"
                           f" {i + 1}: {e}")
-            # Render em OCR_DPI (400): mais pixels por glifo, menos colapso de
-            # letras finas. Pré-processa (cinza + contraste + binarização) para
-            # destacar o texto cinza serrilhado antes de reconhecer. A escala
-            # tem o cap OCR_MAX_LADO_PX p/ mediabox gigante (_escala_render).
-            img = doc[i].render(scale=_escala_render(page)).to_pil()
-            img_ocr = _preparar_imagem_ocr(img)
-            print(f"   OCR pagina {i + 1}...", flush=True)
-            dados = pytesseract.image_to_data(
-                img_ocr, lang=lang, config=cfg_ocr,
-                output_type=pytesseract.Output.DICT)
-            box = page.mediabox
-            x0 = float(box[0])
-            y0 = float(box[1])
-            W = float(box[2]) - x0
-            H = float(box[3]) - y0
-            sx, sy = W / img.width, H / img.height
+            tarefas.append({"idx": i, "modo": "pagina",
+                            "escala": _escala_render(page),
+                            "mediabox": mediabox, "cands": []})
+        if not tarefas:
+            return 0, info
 
-            # Neutraliza qualquer CTM herdado do conteúdo original (ex.: o
-            # 0.75 0 0 -0.75 0 H típico do SIG), para que as coordenadas em
-            # pontos de página fiquem absolutas e o texto caia EXATAMENTE sobre
-            # a imagem.
-            m_inv = _inverter_matriz(_ctm_residual(page)) or I
-            corpo_ocr, _pals, _confs = _linhas_texto_ocr(
-                dados, x0, y0, H, sx, sy)
-            if not corpo_ocr:
-                continue
-            linhas = ([b"q",
-                       ("%.6f %.6f %.6f %.6f %.4f %.4f cm" % m_inv)
-                       .encode("latin-1"),
-                       b"BT", b"3 Tr"] + corpo_ocr + [b"ET", b"Q"])
-            _garantir_fonte(pdf, page, "/FOCR")
-            page.contents_add(pdf.make_stream(b"\n".join(linhas)),
-                              prepend=False)
-            n_ocr += 1
-        if n_ocr:
+        # ---------- execução (workers) + montagem (pai) ---------------------
+        def montar(r):
+            nonlocal n_ocr
+            i = r["idx"]
+            page = pdf.pages[i]
+            box = page.mediabox
+            mx0, my0 = float(box[0]), float(box[1])
+            Wm, Hm = float(box[2]) - mx0, float(box[3]) - my0
+            sx, sy = Wm / r["px"][0], Hm / r["px"][1]
+            if r["modo"] == "pagina":
+                if r["dados"] is None:
+                    return  # página em branco (O4)
+                print(f"   OCR pagina {i + 1}...", flush=True)
+                corpo, _pals, _confs = _linhas_texto_ocr(
+                    r["dados"], mx0, my0, Hm, sx, sy)
+                if not corpo:
+                    return
+                _ocr_camada(pdf, page, corpo)
+                n_ocr += 1
+                return
+            # regiões de imagem embutida
+            linhas_pag, blocos = [], []
+            for reg in r["regs"]:
+                linhas, palavras, confs = _linhas_texto_ocr(
+                    reg["dados"], mx0, my0, Hm, sx, sy,
+                    dx_px=reg["cx0"], dy_px=reg["cy0"])
+                texto = " ".join(palavras).strip()
+                if not texto:
+                    continue
+                if _texto_contido(texto, existentes[i]):
+                    continue  # já está no corpo: não duplica (nem embute)
+                linhas_pag += linhas
+                blocos.append((texto, sum(confs) / len(confs)))
+            if linhas_pag:
+                _ocr_camada(pdf, page, linhas_pag)
+            if blocos:
+                print(f"   OCR de imagem embutida na pagina {i + 1}"
+                      f" ({len(blocos)} bloco(s))...", flush=True)
+                n_ocr += 1
+            if blocos or manuscritos[i]:
+                info[i] = {"blocos": blocos, "manuscrito": manuscritos[i]}
+
+        n_workers = _ocr_workers_auto(
+            workers if workers is not None and workers > 0 else OCR_WORKERS)
+        feitas = 0
+        if n_workers > 1 and len(tarefas) > 1:
+            from concurrent.futures import ProcessPoolExecutor
+            exe = ProcessPoolExecutor(
+                max_workers=min(n_workers, len(tarefas)),
+                initializer=_ocr_worker_init,
+                initargs=(str(pdf_path),
+                          getattr(pytesseract.pytesseract, "tesseract_cmd",
+                                  None),
+                          os.environ.get("TESSDATA_PREFIX")))
+            try:
+                for r in exe.map(_ocr_worker,
+                                 [(t, lang, cfg_ocr) for t in tarefas]):
+                    if cancelar is not None and cancelar.is_set():
+                        cancelado = True
+                        break
+                    montar(r)
+                    feitas += 1
+                    if progresso:
+                        progresso("ocr", feitas, len(tarefas),
+                                  f"página {r['idx'] + 1}")
+            finally:
+                exe.shutdown(wait=True, cancel_futures=True)
+        else:
+            for t in tarefas:
+                if cancelar is not None and cancelar.is_set():
+                    cancelado = True
+                    break
+                r = _ocr_executar_tarefa(doc, t, lang, cfg_ocr)
+                montar(r)
+                feitas += 1
+                if progresso:
+                    progresso("ocr", feitas, len(tarefas),
+                              f"página {t['idx'] + 1}")
+
+        if n_ocr and not cancelado:
             doc.close()
             doc = None
             pdf.save(pdf_path)
@@ -2059,7 +2295,8 @@ def _rotulo_pagina(num: int, total: int) -> str:
     return f"[Pagina {num} de {total}]"
 
 
-def numerar_paginas(pdf_path: Path, total: int, inicio: int = 1) -> int:
+def numerar_paginas(pdf_path: Path, total: int, inicio: int = 1,
+                    progresso=None, cancelar=None) -> int:
     """Carimba, em CADA página do PDF, um número visível no canto superior
     direito (Helvetica/Arial 10, preto), como camada de texto selecionável e
     pesquisável — legível tanto pelo usuário quanto pela IA.
@@ -2076,7 +2313,10 @@ def numerar_paginas(pdf_path: Path, total: int, inicio: int = 1) -> int:
     deslocado. Retorna o nº de páginas numeradas."""
     n_num = 0
     with pikepdf.open(pdf_path, allow_overwriting_input=True) as pdf:
+        n_pag = len(pdf.pages)
         for i, page in enumerate(pdf.pages):
+            if cancelar is not None and cancelar.is_set():
+                return 0   # sem save: o arquivo fica como estava
             num = inicio + i
             rotulo = _rotulo_pagina(num, total)
             box = page.mediabox
@@ -2107,6 +2347,8 @@ def numerar_paginas(pdf_path: Path, total: int, inicio: int = 1) -> int:
             page.contents_add(pdf.make_stream(b"\n".join(linhas)),
                               prepend=False)
             n_num += 1
+            if progresso:
+                progresso("numeracao", i + 1, n_pag, f"página {num}")
         pdf.save(pdf_path)
     return n_num
 
@@ -2122,7 +2364,7 @@ def _salvar_bloco(pdf, ini: int, fim: int, destino: Path) -> int:
     return destino.stat().st_size
 
 
-def dividir_pdf(caminho: Path, max_mb: float):
+def dividir_pdf(caminho: Path, max_mb: float, progresso=None, cancelar=None):
     """Divide o PDF em partes de até 'max_mb' MB (tamanho REAL do arquivo).
 
     Estratégia CRESCER-GRAVAR-MEDIR: o bloco cresce página a página e, a cada
@@ -2149,6 +2391,15 @@ def dividir_pdf(caminho: Path, max_mb: float):
             n = len(pdf.pages)
             i, k = 0, 0
             while i < n:
+                if cancelar is not None and cancelar.is_set():
+                    # aborta a divisão INTEIRA: apaga as partes já gravadas e
+                    # devolve o arquivo original intacto (nada pela metade)
+                    for p, _off in partes:
+                        try:
+                            p.unlink()
+                        except OSError:
+                            pass
+                    return [(caminho, 1)]
                 k += 1
                 fim = i + 1
                 tam = _salvar_bloco(pdf, i, fim, tmp)
@@ -2167,6 +2418,8 @@ def dividir_pdf(caminho: Path, max_mb: float):
                 tmp.replace(destino)
                 partes.append((destino, i + 1))  # offset = 1ª página da parte
                 i = fim
+                if progresso:
+                    progresso("divisao", i, n, f"parte {k}")
     finally:
         if tmp.exists():
             tmp.unlink()
@@ -2180,17 +2433,72 @@ def dividir_pdf(caminho: Path, max_mb: float):
     return partes
 
 
+# ---------------- planejamento p/ barra de progresso (v2.9/B) ---------------
+# Pesos em "unidades de trabalho" POR PÁGINA, calibrados pelos tempos MEDIDOS
+# do perfil (PERFIL_ANTES/DEPOIS.md, s/página no acervo de referência), para
+# que a barra seja aproximadamente linear no TEMPO real — é o que o usuário
+# percebe como "barra honesta". P_OCR domina, como esperado.
+P_LIMPEZA = 1.0     # limpeza estrutural (análise + reescrita): ~0,5 s/pág
+P_OCR = 2.6         # página de OCR com paralelismo automático: ~1,3 s/pág
+P_NUMERA = 0.2      # carimbo de paginação: ~0,09 s/pág
+P_EXPORT = 0.4      # exportação .md (pós-O5): ~0,2 s/pág
+P_DIVIDE = 0.2      # divisão (crescer-gravar-medir), por página gravada
+
+
+def planejar(arquivos, com_ocr: bool = True, progresso=None):
+    """Pré-passagem de planejamento (Tarefa B): para cada PDF, conta as
+    páginas e QUANTAS realmente irão para o OCR de página inteira
+    (_texto_e_aproveitavel num varrimento rápido de get_textpage — ms/página).
+    Devolve uma lista de dicts {"arquivo", "paginas", "paginas_ocr",
+    "unidades"} — um ORÇAMENTO exato de unidades de trabalho, não estimativa
+    por arquivo. Nunca quebra: erro num arquivo vira orçamento aproximado."""
+    import pypdfium2 as pdfium
+    plano = []
+    for k, arq in enumerate(arquivos):
+        n = n_ocr = 0
+        try:
+            doc = pdfium.PdfDocument(str(arq))
+            try:
+                n = len(doc)
+                for i in range(n):
+                    tp = doc[i].get_textpage()
+                    t = tp.get_text_range() or ""
+                    tp.close()
+                    if not _texto_e_aproveitavel(t):
+                        n_ocr += 1
+            finally:
+                doc.close()
+        except Exception:
+            n = max(n, 1)
+            n_ocr = n
+        unidades = (n * (P_LIMPEZA + P_NUMERA + P_EXPORT + P_DIVIDE)
+                    + (n_ocr * P_OCR if com_ocr else 0))
+        plano.append({"arquivo": Path(arq), "paginas": n,
+                      "paginas_ocr": n_ocr, "unidades": unidades})
+        if progresso:
+            progresso("planejamento", k + 1, len(arquivos), Path(arq).name)
+    return plano
+
+
 # ------------------------------- CLI ----------------------------------------
 
-def limpa_pdf(origem: Path, destino: Path, sem_cabecalho: bool) -> int:
+def limpa_pdf(origem: Path, destino: Path, sem_cabecalho: bool,
+              progresso=None, cancelar=None) -> int:
+    """Limpeza estrutural. 'progresso'/'cancelar' (v2.9/B): callback opcional
+    de progresso e threading.Event de cancelamento — cancelado ANTES do save,
+    o destino não é gravado (nunca fica PDF pela metade)."""
     n_alt = 0
     n_prot = 0
     with pikepdf.open(origem) as pdf:
+        n_pag = len(pdf.pages)
         if sem_cabecalho:
-            boiler, boiler_base_P, cortes, faixas_base = analisar(pdf)
+            boiler, boiler_base_P, cortes, faixas_base = analisar(
+                pdf, progresso=progresso)
         else:
             boiler, boiler_base_P, cortes, faixas_base = set(), set(), {}, {}
         for idx, page in enumerate(pdf.pages):
+            if cancelar is not None and cancelar.is_set():
+                return n_alt   # sem save: o original fica intocado
             alterado, protegido = reescrever(
                 pdf, page, idx, boiler, boiler_base_P, cortes, faixas_base,
                 sem_cabecalho)
@@ -2198,6 +2506,8 @@ def limpa_pdf(origem: Path, destino: Path, sem_cabecalho: bool) -> int:
                 n_alt += 1
             if protegido:
                 n_prot += 1
+            if progresso:
+                progresso("limpeza", idx + 1, n_pag, f"página {idx + 1}")
         pdf.save(destino, compress_streams=True,
                  object_stream_mode=pikepdf.ObjectStreamMode.generate)
     if n_prot:
@@ -2207,6 +2517,12 @@ def limpa_pdf(origem: Path, destino: Path, sem_cabecalho: bool) -> int:
 
 
 def main():
+    # OBRIGATÓRIO antes de qualquer coisa: sem isto, o executável congelado
+    # (PyInstaller) entra em "fork bomb" no Windows quando o OCR paralelo
+    # cria os processos worker (o spawn reexecuta o exe).
+    import multiprocessing
+    multiprocessing.freeze_support()
+
     ap = argparse.ArgumentParser(description="Limpa PDFs do SIG MPSC (v2)")
     ap.add_argument("entrada", help="Arquivo PDF ou pasta com PDFs")
     ap.add_argument("--saida", help="Pasta de saída (padrão: sufixo _limpo)")
@@ -2225,6 +2541,9 @@ def main():
                     help="NÃO carimba o número da página no canto superior"
                          " direito (por padrão a paginação contínua é"
                          " aplicada para facilitar a referência por IA)")
+    ap.add_argument("--workers", type=int, default=0,
+                    help="nº de processos de OCR em paralelo (0 = automático:"
+                         " núcleos-1 com teto por RAM; 1 = sequencial)")
     args = ap.parse_args()
 
     lang = cfg = None
@@ -2261,7 +2580,8 @@ def main():
         info_ocr = {}
         if lang:
             try:
-                n_ocr, info_ocr = embutir_ocr(destino, lang, cfg)
+                n_ocr, info_ocr = embutir_ocr(destino, lang, cfg,
+                                              workers=args.workers)
                 if n_ocr:
                     print(f"   OCR embutido em {n_ocr} páginas (texto"
                           " selecionável).")
