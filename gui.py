@@ -217,23 +217,60 @@ def _coletar_arquivos(entradas: list[Path]) -> list[tuple[Path, Path]]:
 
 
 # ── 2. WORKER ─────────────────────────────────────────────────────────────── #
+#
+# Barra HONESTA (v2.9/Tarefa B): o percentual anda continuamente DENTRO de um
+# único arquivo. Antes era arquivos_concluídos/total — com 1 PDF (o caso mais
+# comum) a barra ficava em 0% do começo ao fim.
+#
+#   1. planejar() (núcleo) conta páginas e páginas de OCR de cada PDF →
+#      orçamento EXATO em unidades de trabalho (pesos P_* medidos no perfil).
+#   2. Cada função pesada do núcleo chama progresso(etapa, feito, total,
+#      detalhe); o worker converte em unidades globais e emite o sinal Qt.
+#   3. Emissão limitada a <= 10/s; o percentual NUNCA retrocede; 100% só ao
+#      final de tudo. ETA por média móvel exponencial (oculto nos primeiros
+#      5%, que são ruído).
+#   4. Cancelar = threading.Event verificado entre páginas no núcleo; nenhuma
+#      função grava arquivo pela metade (todas salvam só ao final).
+
+ETAPA_ROTULOS = {
+    "planejamento": "Planejando",
+    "analise":      "Analisando páginas",
+    "limpeza":      "Limpando",
+    "ocr":          "OCR",
+    "numeracao":    "Numerando páginas",
+    "divisao":      "Dividindo",
+    "exportacao":   "Gerando .md",
+}
+
+
+def _fmt_hms(seg: float) -> str:
+    seg = max(0, int(seg))
+    h, resto = divmod(seg, 3600)
+    m, s = divmod(resto, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def _fmt_eta(seg: float) -> str:
+    if seg < 90:
+        return f"resta ~{max(10, int(seg / 10) * 10)} s"
+    return f"restam ~{int(round(seg / 60))} min"
 
 
 class Worker(QThread):
-    progresso = Signal(int, str)
+    progresso = Signal(int, str, str, str)   # pct, etapa, detalhe, eta
     log      = Signal(str)
-    terminou = Signal(list, bool)   # (arquivos_gerados, cancelado)
+    terminou = Signal(list, bool)            # (arquivos_gerados, cancelado)
     erro     = Signal(str)
-
-    _cancelar: bool = False
 
     def __init__(self, entradas: list[Path], opcoes: dict):
         super().__init__()
         self.entradas = entradas
         self.opcoes = opcoes
+        import threading
+        self._cancelar = threading.Event()
 
     def requisitar_cancelamento(self) -> None:
-        self._cancelar = True
+        self._cancelar.set()
 
     def run(self):
         try:
@@ -241,50 +278,108 @@ class Worker(QThread):
         except Exception as e:
             self.erro.emit(str(e))
 
+    # ── contabilidade de progresso ─────────────────────────────────────────── #
+    def _emitir(self, unidades, etapa, detalhe, forcar=False):
+        import time
+        agora = time.monotonic()
+        if not forcar and agora - self._ult_emissao < 0.1:
+            return                       # taxa <= 10 emissões/segundo
+        self._ult_emissao = agora
+        pct = 0
+        if self._total_unidades > 0:
+            pct = int(min(99.0, unidades / self._total_unidades * 100.0))
+        pct = max(pct, self._ult_pct)    # o percentual NUNCA retrocede
+        self._ult_pct = pct
+        eta = ""
+        decorrido = agora - self._inicio
+        if unidades > 0 and self._total_unidades > 0:
+            spu = decorrido / unidades   # segundos por unidade
+            self._ema = spu if self._ema is None else 0.3 * spu + 0.7 * self._ema
+            if pct >= 5:                 # ETA nos primeiros 5% é ruído
+                restante = (self._total_unidades - unidades) * self._ema
+                eta = f"decorrido {_fmt_hms(decorrido)} · {_fmt_eta(restante)}"
+            else:
+                eta = f"decorrido {_fmt_hms(decorrido)}"
+        self.progresso.emit(pct, ETAPA_ROTULOS.get(etapa, etapa), detalhe, eta)
+
     def _executar(self):
+        import time
         op = self.opcoes
         pares = _coletar_arquivos(self.entradas)
         if not pares:
             self.erro.emit("Nenhum PDF encontrado.")
             return
 
+        self._inicio = time.monotonic()
+        self._ult_emissao = 0.0
+        self._ult_pct = 0
+        self._ema = None
+        self._total_unidades = 0.0
+
         lang, cfg = "", ""
         if op["ocr"]:
-            self.progresso.emit(0, "Localizando o motor de OCR (Tesseract)...")
+            self.progresso.emit(0, "Preparando",
+                                "Localizando o motor de OCR (Tesseract)...", "")
             lang, cfg = core._preparar_ocr()
             if not lang:
                 self.log.emit("[AVISO] OCR indisponível; seguindo sem OCR.")
 
+        # 1. Orçamento exato: páginas e páginas de OCR de cada arquivo.
+        self.progresso.emit(0, "Planejando", "Contando páginas...", "")
+        plano = core.planejar([a for a, _p in pares], com_ocr=bool(lang))
+        self._total_unidades = sum(p["unidades"] for p in plano)
+        self._inicio = time.monotonic()   # zera o relógio após o planejamento
+
         gerados: list[str] = []
         total = len(pares)
+        u_antes = 0.0                     # unidades dos arquivos concluídos
 
         for k, (arq, pasta_saida) in enumerate(pares):
-            if self._cancelar:
+            if self._cancelar.is_set():
                 break
+            info = plano[k]
+            n_pag = info["paginas"]
+            rot_arq = f"Arquivo {k + 1}/{total} · {arq.name}"
+            # orçamento por etapa DESTE arquivo (unidades):
+            budgets = {
+                "analise":    0.4 * core.P_LIMPEZA * n_pag,
+                "limpeza":    0.6 * core.P_LIMPEZA * n_pag,
+                "ocr":        core.P_OCR * info["paginas_ocr"] if lang else 0.0,
+                "numeracao":  core.P_NUMERA * n_pag if op["paginar"] else 0.0,
+                "divisao":    core.P_DIVIDE * n_pag,
+                "exportacao": core.P_EXPORT * n_pag if op["md"] else 0.0,
+            }
+            estado = {"etapa": None, "u_base": u_antes}
 
-            pct = int(k / total * 100)
-            msg = f"[{k+1}/{total}] Limpando {arq.name}..."
-            self.progresso.emit(pct, msg)
-            self.log.emit(msg)
+            def cb(etapa, feito, feito_total, detalhe="", _b=budgets, _e=estado,
+                   _rot=rot_arq):
+                if etapa != _e["etapa"]:
+                    if _e["etapa"] is not None:
+                        _e["u_base"] += _b.get(_e["etapa"], 0.0)
+                    _e["etapa"] = etapa
+                frac = (feito / feito_total) if feito_total else 1.0
+                u = _e["u_base"] + _b.get(etapa, 0.0) * frac
+                det = f"{_rot} — {detalhe} de {feito_total}" if detalhe else _rot
+                self._emitir(u, etapa, det)
 
+            self.log.emit(f"[{k + 1}/{total}] Limpando {arq.name}...")
             pasta_saida.mkdir(parents=True, exist_ok=True)
             destino = pasta_saida / arq.name
-            core.limpa_pdf(arq, destino, op["sem_cabecalho"])
-
-            if self._cancelar:
+            core.limpa_pdf(arq, destino, op["sem_cabecalho"],
+                           progresso=cb, cancelar=self._cancelar)
+            if self._cancelar.is_set():
                 break
 
             info_ocr = {}
             if lang:
-                msg = f"[{k+1}/{total}] OCR em {arq.name} (pode demorar)..."
-                self.progresso.emit(pct, msg)
-                self.log.emit(msg)
+                self.log.emit(f"[{k + 1}/{total}] OCR em {arq.name}...")
                 try:
-                    _n_ocr, info_ocr = core.embutir_ocr(destino, lang, cfg)
+                    _n_ocr, info_ocr = core.embutir_ocr(
+                        destino, lang, cfg, workers=op.get("workers", 0),
+                        progresso=cb, cancelar=self._cancelar)
                 except Exception as e:
                     self.log.emit(f"[AVISO] OCR falhou: {e}")
-
-                if self._cancelar:
+                if self._cancelar.is_set():
                     break
 
             # Total de páginas do PDF limpo (já com OCR): usado pela paginação
@@ -298,37 +393,47 @@ class Worker(QThread):
                 pass
 
             if op["paginar"] and total_pag:
-                self.log.emit(f"[{k+1}/{total}] Numerando páginas de {arq.name}...")
+                self.log.emit(f"[{k + 1}/{total}] Numerando páginas de {arq.name}...")
                 try:
-                    core.numerar_paginas(destino, total_pag, inicio=1)
+                    core.numerar_paginas(destino, total_pag, inicio=1,
+                                         progresso=cb, cancelar=self._cancelar)
                 except Exception as e:
                     self.log.emit(f"[AVISO] Numeração falhou: {e}")
+            if self._cancelar.is_set():
+                break
 
             max_mb = op["max_mb"] if op["dividir"] else 0
             try:
-                partes = core.dividir_pdf(destino, max_mb)
+                partes = core.dividir_pdf(destino, max_mb,
+                                          progresso=cb, cancelar=self._cancelar)
             except Exception:
                 partes = [(destino, 1)]
 
             for parte, offset in partes:
                 gerados.append(parte.name)
-                if op["md"]:
+                if op["md"] and not self._cancelar.is_set():
                     md = parte.with_suffix(".md")
                     try:
                         core.exportar_md(parte, md, offset=offset,
-                                         total=total_pag, info_ocr=info_ocr)
+                                         total=total_pag, info_ocr=info_ocr,
+                                         progresso=cb, cancelar=self._cancelar)
                         if md.is_file():
                             gerados.append(md.name)
                     except Exception as e:
                         self.log.emit(f"[AVISO] .md falhou: {e}")
 
-        cancelado = self._cancelar
+            # arquivo concluído: consolida o orçamento inteiro dele
+            u_antes += info["unidades"]
+            self._emitir(u_antes, "limpeza", rot_arq, forcar=True)
+
+        cancelado = self._cancelar.is_set()
         if cancelado:
             self.log.emit(
                 f"Cancelado. {len(gerados)} arquivo(s) gerado(s) antes do cancelamento."
             )
         else:
-            self.progresso.emit(100, "Concluído.")
+            self._ult_pct = 100
+            self.progresso.emit(100, "Concluído", "", "")
             self.log.emit(f"Concluído. {len(gerados)} arquivo(s) gerado(s).")
 
         self.terminou.emit(gerados, cancelado)
@@ -474,7 +579,23 @@ class JanelaPrincipal(QWidget):
         div.addWidget(self.spin_mb)
         div.addStretch()
 
+        # Processos de OCR em paralelo (v2.9/O1). 0 = automático (núcleos-1
+        # com teto por RAM). Opção avançada: o padrão serve para todo mundo.
+        wrk = QHBoxLayout()
+        lbl_wrk = QLabel("Processos de OCR em paralelo:")
+        self.spin_workers = QSpinBox()
+        self.spin_workers.setRange(0, 32)
+        self.spin_workers.setValue(0)
+        self.spin_workers.setSpecialValueText("automático")
+        self.spin_workers.setToolTip(
+            "0 = automático (recomendado). Aumente ou reduza apenas se "
+            "souber o que está fazendo — mais processos usam mais memória.")
+        wrk.addWidget(lbl_wrk)
+        wrk.addWidget(self.spin_workers)
+        wrk.addStretch()
+
         op.addWidget(self.chk_ocr)
+        op.addLayout(wrk)
         op.addWidget(self.chk_pag)
         op.addLayout(div)
         op.addWidget(self.chk_md)
@@ -548,6 +669,7 @@ class JanelaPrincipal(QWidget):
             "max_mb":        self.spin_mb.value(),
             "md":            self.chk_md.isChecked(),
             "sem_cabecalho": True,
+            "workers":       self.spin_workers.value(),
         }
         self._processando = True
         self._pasta_saida = None
@@ -576,9 +698,17 @@ class JanelaPrincipal(QWidget):
         self.lbl_status.setText("Cancelando... aguarde o arquivo atual terminar.")
 
     # ── slots de sinal ─────────────────────────────────────────────────────── #
-    def _on_progresso(self, pct: int, texto: str):
+    def _on_progresso(self, pct: int, etapa: str, detalhe: str, eta: str):
         self.barra.setValue(pct)
-        self.lbl_status.setText(texto)
+        linhas = []
+        if detalhe:
+            linhas.append(detalhe)
+        rodape = f"Etapa: {etapa}" if etapa else ""
+        if eta:
+            rodape = f"{rodape} · {eta}" if rodape else eta
+        if rodape:
+            linhas.append(rodape)
+        self.lbl_status.setText("\n".join(linhas))
 
     def _on_log(self, linha: str):
         self.log_area.appendPlainText(linha)
@@ -624,6 +754,12 @@ class JanelaPrincipal(QWidget):
 
 
 def main():
+    # OBRIGATÓRIO antes de qualquer coisa: sem isto, o executável congelado
+    # (PyInstaller) entra em "fork bomb" no Windows quando o OCR paralelo
+    # cria os processos worker (o spawn reexecuta o exe).
+    import multiprocessing
+    multiprocessing.freeze_support()
+
     app = QApplication(sys.argv)
     aplicar_tema(app)
     win = JanelaPrincipal()
