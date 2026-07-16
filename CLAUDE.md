@@ -29,8 +29,31 @@ autorização de componentes (Python, Tesseract) passa pela **COTEC**.
 ## 2. Estado atual e arquivos
 
 A lógica de limpeza está madura, validada em produção e UNIFICADA numa **base
-única, hoje v2.8** (`limpa_pdf_mpsc.py`). A GUI PySide6 (`gui.py`) está pronta e
-empacotada (PyInstaller + Inno Setup). A v2.8 tem:
+única, hoje v2.9** (`limpa_pdf_mpsc.py`). A GUI PySide6 (`gui.py`) está pronta e
+empacotada (PyInstaller + Inno Setup). A v2.9 corrigiu o defeito "apagou
+demais" (diagnóstico empírico em `auditoria_limpeza.py` +
+`RELATORIO_APAGOU_DEMAIS.md`; regressão em `tests/regressao/`):
+
+- **Regra do CENTRO nos cortes**: cortes de cabeçalho/rodapé só removem
+  imagem/caminho cujo CENTRO esteja na faixa — elemento que apenas encosta ou
+  cruza o corte é conteúdo do corpo (prints/certidões escaneadas terminam
+  encostados na régua e eram engolidos inteiros). Exceção: tarja da
+  assinatura lateral (`_eh_tarja_assinatura`).
+- **Zonas de tabela protegidas** (`zonas_tabela`): grade com >= 2 linhas
+  horizontais e >= 2 verticais conectadas (ou caixa traçada) — nenhuma regra
+  heurística remove elemento com centro lá dentro; só assinatura e carimbo.
+- **Régua medida**: `LIM_REGUA_TOPO = 0.85` / `LIM_REGUA_BASE = 0.11`
+  (verdadeiras do acervo: 0,864–0,908 topo, 0,068–0,094 base) e
+  `_regua_caixa` rejeita candidata com verticais nos cantos (borda de print
+  repetido não vira mais corte por repetição).
+- **Rollback por página** (`reescrever` → `(alterado, protegido)`): remoção
+  heurística > 35% dos chars (`LIMITE_PERDA_PAGINA`, com piso de 200 chars)
+  ou > 10% da área em imagens (`LIMITE_PERDA_AREA_IMG`) descarta a reescrita
+  e mantém a página intacta, com log `[protecao]`.
+- `reescrever()` produz um MOTIVO nomeado por remoção (auditável); a
+  auditoria (`auditoria_limpeza.py --auditar`) mede perda real por motivo.
+
+Herdado da v2.8:
 
 - **Saída SEMPRE em Markdown** (`exportar_md`, substituiu `exportar_txt`): título
   `# <arquivo>` com metadados (nº do processo `PROC_REGEX`, unidade
@@ -75,24 +98,40 @@ Proposta `.docx` não estão mais no repositório (só os PDFs gerados
 A GUI deve importar o módulo e chamar estas funções diretamente, **sem** rodar o
 `.bat` nem invocar o Python como subprocesso:
 
-- `limpa_pdf(origem: Path, destino: Path, sem_cabecalho: bool) -> int`
+Todas as funções pesadas aceitam (v2.9) `progresso=None` — callable
+`progresso(etapa, feito, total, detalhe="")`, o núcleo NÃO conhece Qt — e
+`cancelar=None` (`threading.Event`; cancelado, NADA é gravado pela metade:
+toda função salva só ao final).
+
+- `limpa_pdf(origem: Path, destino: Path, sem_cabecalho: bool, progresso=None,
+  cancelar=None) -> int`
   Limpeza estrutural (assinatura, carimbo, cabeçalho/rodapé). Retorna nº de
-  páginas alteradas.
-- `embutir_ocr(pdf_path: Path, lang: str, cfg: str) -> tuple[int, dict]`
+  páginas alteradas. Loga `[protecao]` quando o rollback mantém uma página.
+- `embutir_ocr(pdf_path: Path, lang: str, cfg: str, workers: int = None,
+  progresso=None, cancelar=None) -> tuple[int, dict]`
   OCR nas páginas SEM camada de texto (página inteira) E nas imagens embutidas
   de páginas COM texto (por região); insere texto invisível selecionável.
+  `workers`: nº de processos em paralelo (None/0 = automático; 1 = sequencial).
   Retorna `(n_paginas_ocr, info_ocr)`, onde `info_ocr =
   {pag_0based: {"blocos": [(texto, conf_media)], "manuscrito": bool}}` —
   repassar a `exportar_md`. Requer `_preparar_ocr()` antes.
-- `numerar_paginas(pdf_path: Path, total: int, inicio: int = 1) -> int`
+- `numerar_paginas(pdf_path: Path, total: int, inicio: int = 1, ...) -> int`
   Carimbo de paginação contínua. Chamado sobre o PDF INTEIRO, antes de dividir.
-- `dividir_pdf(caminho: Path, max_mb: float) -> list[(Path, offset)]`
+- `dividir_pdf(caminho: Path, max_mb: float, ...) -> list[(Path, offset)]`
   Divide em partes de até `max_mb` MB (tamanho REAL, crescer-gravar-medir);
   offset = 1ª página da parte no documento. `max_mb <= 0` = não dividir.
-- `exportar_md(pdf_path, md_path, offset=1, total=0, info_ocr=None)` — gera o
-  `.md` estruturado (metadados, `## Página N de TOTAL`, peças, tabelas reais,
-  blocos de OCR de imagem, banner de manuscrito).
+- `exportar_md(pdf_path, md_path, offset=1, total=0, info_ocr=None, ...)` —
+  gera o `.md` estruturado (metadados, `## Página N de TOTAL`, peças, tabelas
+  reais, blocos de OCR de imagem, banner de manuscrito).
+- `planejar(arquivos, com_ocr=True) -> list[dict]` — pré-passagem p/ a barra
+  de progresso: páginas e páginas de OCR por arquivo + orçamento em unidades
+  de trabalho (pesos `P_LIMPEZA/P_OCR/P_NUMERA/P_EXPORT/P_DIVIDE`, medidos).
 - `_preparar_ocr() -> (lang, cfg)` — localiza Tesseract e idioma português.
+
+**IMPORTANTE (multiprocessing):** qualquer entry point (CLI, GUI) precisa
+chamar `multiprocessing.freeze_support()` no início do `main()` — sem isso o
+exe do PyInstaller entra em fork bomb no Windows quando o OCR paralelo sobe
+os workers.
 
 **Ordem do pipeline (replicar o que o `main()` faz hoje):**
 1. `limpa_pdf` → 2. `embutir_ocr` (se OCR ligado; guarda `info_ocr`) →
@@ -252,7 +291,13 @@ limpa); operação offline; pipeline na ordem da seção 3.
 - [x] Inicializar repositório Git (privado: github.com/marvinds-ribeiro/limpa-pdf).
 - [x] **v2.8:** saída sempre em .md estruturado; OCR de imagens embutidas
       (prints/manuscritos); avisos removidos; OCR padrão na GUI; divisão por MB.
-- [ ] Reempacotar o instalador com a v2.8 (PyInstaller + Inno Setup).
+- [x] **v2.9:** fim do "apagou demais" (regra do centro, zonas de tabela,
+      régua medida, rollback por página) + regressão automatizada; OCR em
+      paralelo (portão de qualidade aprovado) e exportação sem pdfplumber
+      desnecessário; barra de progresso honesta na GUI (planejar + ETA +
+      Cancelar).
+- [ ] Reempacotar o instalador com a v2.9 (PyInstaller + Inno Setup;
+      atenção ao freeze_support/multiprocessing no exe).
 - [ ] Proposta formal à COTEC para autorizar a distribuição via ZenWorks;
       verificar code signing do `setup.exe`.
 

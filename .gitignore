@@ -16,6 +16,11 @@ build/
 LIMPOS/
 exemplos/
 prints/
+_perfil_tmp/
+tests/regressao/_saida/
+
+# Backups locais do repositório
+limpapdf.git.zip
 
 # Imagens de identidade visual (binários grandes, fora do escopo do código)
 *.png
