@@ -4,7 +4,7 @@
 
 [Setup]
 AppName=Limpa PDF — MPSC
-AppVersion=2.9.0
+AppVersion=2.10.1
 AppPublisher=MPSC
 AppPublisherURL=
 AppSupportURL=
