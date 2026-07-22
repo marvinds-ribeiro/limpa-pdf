@@ -1548,6 +1548,12 @@ def exportar_md(pdf_path: Path, md_path: Path, offset: int = 1,
         else:
             corpo = _marcar_pecas(corpo)
         sec = [f"## Página {num} de {total}", ""]
+        # v2.10 (atl.md §8): origem do texto da página, para o leitor (e a IA
+        # a jusante) saberem de onde cada trecho veio. Só existe quando o OCR
+        # rodou (embutir_ocr preenche info_ocr para toda página).
+        origem = info.get("origem")
+        if origem:
+            sec += [f"_[{origem}]_", ""]
         if info.get("manuscrito"):
             sec += ["> **[Documento manuscrito — OCR de baixa confiança,"
                     " revisar no original]**", ""]
