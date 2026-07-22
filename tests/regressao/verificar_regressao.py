@@ -86,7 +86,11 @@ def _molduras_removidas(pdf_path: Path):
             chaves = []
             for i, (kind, key, bbox, _ins, rot) in enumerate(els):
                 m = nucleo._motivo_remocao(i, kind, key, bbox, rot, ctx)
-                if m in MOTIVOS_MOLDURA and bbox:
+                # bbox (0,0,0,0) = bloco de texto que não mostra nada (só
+                # estado, ex.: "BT /F1 Tf ET" do e-proc). v2.10.1: nunca é
+                # removido (removê-lo deixava o texto mantido sem fonte) e
+                # não é moldura visível — fora do contrato de remoção.
+                if m in MOTIVOS_MOLDURA and bbox and bbox != (0, 0, 0, 0):
                     chaves.append(_chave_el(kind, bbox))
             if chaves:
                 out[str(idx)] = sorted(chaves)

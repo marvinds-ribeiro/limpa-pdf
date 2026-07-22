@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-limpa_pdf_mpsc.py — v2.10 — Limpeza em lote de PDFs exportados do SIG (Softplan/MPSC)
+limpa_pdf_mpsc.py — v2.10.1 — Limpeza em lote de PDFs exportados do SIG (Softplan/MPSC)
 
 Remove, em qualquer layout (GAECO, CAT, Promotorias...):
   1. Assinatura digital vertical da margem (texto rotacionado OU vetorizado) — sempre
@@ -15,6 +15,20 @@ Extras:
   --ocr     OCR (Tesseract) nas páginas sem texto aproveitável E nas imagens
             embutidas de páginas com texto (prints, documentos anexados)
   --max-mb  Divide o resultado em partes de até N MB (padrão 100; 0 = não)
+
+Novidades da v2.10.1 (correção "página de separação em branco" —
+RELATORIO_EPROC.md §8):
+  - BLOCO DE TEXTO SÓ-ESTADO NUNCA É REMOVIDO: o e-proc seleciona fontes em
+    blocos "BT /F1 10.00 Tf ET" isolados (nenhum caractere mostrado) e o
+    texto seguinte herda a fonte do estado gráfico. Esses blocos repetiam
+    entre páginas, viravam boiler_texto e eram removidos — o texto MANTIDO
+    ficava órfão de fonte e a página renderizava/extraía NADA (o rollback
+    não via: mede chars REMOVIDOS, e o dano era indireto). Agora, elemento
+    "T" com _chars_mostrados == 0 é ESTADO, não conteúdo: jamais removido.
+    Prova de segurança no SIG: as 91 páginas do acervo de regressão limpam
+    byte-idênticas (hash de render + chars por página); só o e-proc muda
+    (págs. de separação voltam a existir: 0 -> 187\168 chars). O baseline de
+    molduras deixou de registrar o elemento degenerado T:0:0:0:0.
 
 Novidades da v2.10 (suporte a PDFs do e-proc/TJSC — diagnóstico empírico em
 diag_eproc.py / RELATORIO_EPROC.md):
@@ -1055,6 +1069,13 @@ def reescrever(pdf, page, idx, boiler, boiler_base_P, cortes, faixas_base,
     remocoes = []
     for i, (kind, key, bbox, instrs, rot) in enumerate(els):
         motivo = _motivo_remocao(i, kind, key, bbox, rot, ctx)
+        # v2.10.1: bloco de texto que NÃO mostra nenhum caractere é ESTADO,
+        # não conteúdo (ex.: e-proc seleciona fontes em "BT /F1 Tf ET"
+        # isolados e o texto seguinte herda a fonte). Removê-lo não apaga
+        # nada visível — mas deixa o texto MANTIDO órfão de fonte e a página
+        # inteira some (RELATORIO_EPROC.md §8). Nunca remover.
+        if motivo and kind == "T" and _chars_mostrados(instrs) == 0:
+            motivo = None
         remocoes.append(motivo)
         if kind == "T":
             n = _chars_mostrados(instrs)

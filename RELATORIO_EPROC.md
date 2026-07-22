@@ -246,3 +246,15 @@ O limpador deixa as páginas de separação do e-proc VISUALMENTE EM BRANCO
 elemento "T" sem texto mostrado que contenha `Tf` (é ESTADO, não conteúdo)
 — ou re-emitir os `Tf` órfãos na reescrita. Exige regravar o baseline de
 molduras se o acervo do SIG tiver blocos Tf-only hoje removidos.
+
+### 8.1 CORRIGIDO na v2.10.1
+
+Regra implementada em `reescrever()`: elemento "T" que não mostra nenhum
+caractere (`_chars_mostrados == 0`) é ESTADO, não conteúdo — nunca é
+removido. Validação: (1) teste sintético do padrão Tf-órfão + teste com a
+página real de separação (tests/test_separacao_eproc.py); (2) as 91 páginas
+do acervo SIG de regressão limpam BYTE-IDÊNTICAS (hash de render + chars);
+(3) ex1.pdf págs. 1 e 32: 0 -> 187/168 chars, tinta 0.000 -> 0.028/0.025 —
+"AUTO DE PRISÃO EM FLAGRANTE" e o nº do processo voltam ao .md como
+_[texto nativo]_. O harness de regressão deixou de registrar o elemento
+degenerado T:0:0:0:0 como moldura (baseline regravado com justificativa).
