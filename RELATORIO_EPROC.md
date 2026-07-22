@@ -219,3 +219,30 @@ Páginas híbridas ordenadas por densidade (chars por 1000 px de tinta) — as d
 Critérios: (1) chars(auto) >= chars(nunca) em toda a amostra — o auto é ADITIVO, nada é removido; (2) moldura presente onde existia; (3) confiança média >= 40. **Resultado: APROVADO**.
 
 Nota: após a LIMPEZA a pág. 23 cai a densidade 43,1 (< 45) e também recebe OCR aditivo no auto — direção segura (só acrescenta; dedup e corte de confiança protegem).
+
+## 8. Páginas de separação (1 e 32) apagadas — causa-raiz (Task 7, só investigação)
+
+O limpador deixa as páginas de separação do e-proc VISUALMENTE EM BRANCO
+(tinta 0.000, 0 chars extraíveis), mas NÃO por decisão errada de conteúdo:
+
+- As decisões por elemento estão corretas: os campos reais ("Tipo documento",
+  "AUTO DE PRISÃO EM FLAGRANTE", nº do processo...) são MANTIDOS; só as 2
+  linhas de cabeçalho e 6-7 elementos `boiler_texto` são removidos.
+- O defeito: o e-proc seleciona fontes em blocos `BT /F1 10.00 Tf ET`
+  ISOLADOS (sem texto mostrado — chave `('T', 0, '')`), e o texto vem em
+  blocos seguintes que herdam a fonte do estado gráfico. Esses blocos
+  Tf-only repetem idênticos em várias páginas → classificados como
+  `boiler_texto` → removidos. O stream reescrito ainda contém TODOS os
+  `Tj` ("AUTO DE PRISÃO..." está lá), mas sem nenhum `Tf` — sem fonte
+  ativa, nenhum leitor renderiza ou extrai nada.
+- Por que o rollback (v2.9) não dispara: `_chars_mostrados` de um bloco
+  Tf-only é 0 — a proteção mede chars REMOVIDOS, e aqui o dano é indireto
+  (o texto mantido fica órfão de fonte). Estruturalmente invisível para a
+  rede de segurança atual.
+- O bug NÃO é da v2.10 (o `ex1 limpo.pdf` da v2.9 já saía em branco nas
+  mesmas páginas) e não afeta o acervo do SIG conhecido (regressão passa).
+
+**Correção proposta (tarefa própria, com regressão):** nunca remover
+elemento "T" sem texto mostrado que contenha `Tf` (é ESTADO, não conteúdo)
+— ou re-emitir os `Tf` órfãos na reescrita. Exige regravar o baseline de
+molduras se o acervo do SIG tiver blocos Tf-only hoje removidos.
