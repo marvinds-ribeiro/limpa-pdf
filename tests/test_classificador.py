@@ -73,6 +73,58 @@ class TestEx1:
             assert tipo is nucleo.TipoPagina.HIBRIDA_COM_OCR
 
 
+@pytest.mark.skipif(not EX1.exists(), reason="exemplos/ex1.pdf ausente")
+def test_embutir_ocr_recupera_hibrida_deficiente(tmp_path):
+    """Integração (atl.md §7): em ex1.pdf, o modo auto precisa rodar OCR nas
+    páginas híbridas deficientes SEM destruir a moldura existente (aditivo).
+    Requer Tesseract; roda só 3 páginas para não demorar."""
+    try:
+        lang, cfg = nucleo._preparar_ocr()
+    except Exception:
+        pytest.skip("Tesseract indisponivel")
+    # recorte com pág. 1 (separação, nativa), 2 (híbrida deficiente) e
+    # 23 (híbrida NÃO deficiente) — 0-based 0, 1, 22
+    alvo = tmp_path / "ex1_recorte.pdf"
+    with pikepdf.open(EX1) as pdf:
+        novo = pikepdf.new()
+        for i in (0, 1, 22):
+            novo.pages.append(pdf.pages[i])
+        novo.save(alvo)
+    n, info = nucleo.embutir_ocr(alvo, lang, cfg, workers=1,
+                                 reocr_hibrido="auto")
+    assert n >= 1                                  # antes da v2.10: 0
+    assert info[0]["origem"] == "texto nativo"
+    assert info[1]["origem"] == "OCR do LIMPAPDF"
+    assert info[2]["origem"] == "camada e-proc reaproveitada"
+    doc = pdfium.PdfDocument(str(alvo))
+    tp = doc[1].get_textpage()
+    t = tp.get_text_range() or ""
+    tp.close()
+    doc.close()
+    assert len(t.strip()) > 400        # moldura (~264) + corpo do OCR
+    assert "Evento 1" in t             # moldura preservada (aditivo!)
+
+
+@pytest.mark.skipif(not EX1.exists(), reason="exemplos/ex1.pdf ausente")
+def test_embutir_ocr_nunca_reusa_sem_ocr(tmp_path):
+    """--reocr-hibrido=nunca: nenhuma página híbrida recebe OCR próprio."""
+    try:
+        lang, cfg = nucleo._preparar_ocr()
+    except Exception:
+        pytest.skip("Tesseract indisponivel")
+    alvo = tmp_path / "ex1_recorte.pdf"
+    with pikepdf.open(EX1) as pdf:
+        novo = pikepdf.new()
+        for i in (1, 22):
+            novo.pages.append(pdf.pages[i])
+        novo.save(alvo)
+    n, info = nucleo.embutir_ocr(alvo, lang, cfg, workers=1,
+                                 reocr_hibrido="nunca")
+    assert n == 0
+    assert info[0]["origem"] == "camada e-proc incompleta — revisar"
+    assert info[1]["origem"] == "camada e-proc reaproveitada"
+
+
 @pytest.mark.skipif(not SIG1.exists(), reason="exemplos/exemplo 1.pdf ausente")
 def test_sig_nativo_nunca_deficiente():
     doc = pdfium.PdfDocument(str(SIG1))

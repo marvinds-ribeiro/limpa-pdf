@@ -1972,6 +1972,32 @@ def classificar_pagina(page_pike, pg_pdfium, texto: str):
     return TipoPagina.IMAGEM_SEM_OCR, False, bbox_scan
 
 
+def decisao_ocr_pagina(page_pike, pg_pdfium, texto: str,
+                       reocr_hibrido: str = REOCR_HIBRIDO_PADRAO) -> str:
+    """Decisão da pré-passagem de embutir_ocr para UMA página, em texto:
+    "pular" | "regioes:N" | "pagina". Espelha exatamente o que embutir_ocr
+    faz — usada por tests/regressao/decisoes_ocr.py para garantir que as
+    decisões do acervo do SIG nunca mudam (atl.md §9)."""
+    tipo, deficiente, _bbox = classificar_pagina(page_pike, pg_pdfium, texto)
+    reusa = (tipo is TipoPagina.NATIVA_DIGITAL
+             or (tipo is TipoPagina.HIBRIDA_COM_OCR
+                 and reocr_hibrido != "sempre"
+                 and not (reocr_hibrido == "auto" and deficiente)))
+    if reusa or (tipo is TipoPagina.HIBRIDA_COM_OCR
+                 and reocr_hibrido != "sempre"):
+        els = _elementos(page_pike)
+        W, H = _grupo(page_pike)
+        cands = [b for kind, _k, b, _ins, rot in (els or [])
+                 if kind in ("I", "II") and b and not rot
+                 and _imagem_candidata_ocr(b, W, H)]
+        if cands:
+            return f"regioes:{len(cands)}"
+        if reusa:
+            return "pular"
+        return "regioes:1"     # OCR aditivo da região do scan (e-proc)
+    return "pagina"
+
+
 def _preparar_imagem_ocr(img):
     """Pré-processa a imagem da página ANTES do OCR, para melhorar a leitura de
     fontes finas e acinzentadas (o caso dos PDFs do SIG renderizados).
@@ -2256,7 +2282,8 @@ def _ocr_executar_tarefa(doc, tarefa, lang, cfg_ocr):
             continue  # erro em uma região só pula aquela região
         regs.append({"dados": dados, "cx0": cx0, "cy0": cy0})
     return {"idx": idx, "modo": "regioes", "regs": regs,
-            "px": (img.width, img.height)}
+            "px": (img.width, img.height),
+            "hibrida": tarefa.get("hibrida", False)}
 
 
 def _ocr_worker(args):
@@ -2280,13 +2307,24 @@ def _ocr_camada(pdf, page, linhas_texto):
 
 
 def embutir_ocr(pdf_path: Path, lang: str, cfg: str, workers: int = None,
-                progresso=None, cancelar=None):
+                progresso=None, cancelar=None,
+                reocr_hibrido: str = REOCR_HIBRIDO_PADRAO):
     """Acrescenta texto invisível de OCR (Text Rendering Mode 3) POR CIMA do
     conteúdo, palavra a palavra, para que o texto fique selecionável e
     pesquisável em qualquer leitor:
       - páginas SEM texto aproveitável: OCR da página inteira (como sempre);
       - páginas COM texto de corpo: OCR por REGIÃO das imagens embutidas
         (prints, documentos anexados — v2.8).
+
+    v2.10: a decisão é do classificador (classificar_pagina, UMA vez por
+    página). 'reocr_hibrido' controla as páginas HÍBRIDAS (scan de página
+    inteira + camada de texto aproveitável — o caso e-proc/TJSC):
+      - "auto" (padrão): reusa a camada quando suficiente; quando DEFICIENTE
+        (densidade < FRAC_TEXTO_MIN_HIBRIDO), roda o OCR próprio na região do
+        scan SEM remover nada (aditivo — a moldura/camada existente fica);
+      - "nunca": sempre reusa a camada existente (avisa se deficiente);
+      - "sempre": remove a camada existente e reOCRiza a página inteira
+        (lento e pode não melhorar — avisado no main()).
 
     v2.9 (Tarefa C): o trabalho por página roda em PARALELO num
     ProcessPoolExecutor (vide _ocr_worker; 'workers' = nº de processos,
@@ -2297,8 +2335,11 @@ def embutir_ocr(pdf_path: Path, lang: str, cfg: str, workers: int = None,
     SEM salvar (o arquivo fica como estava).
 
     Retorna (n_paginas_ocr, info_ocr). info_ocr é consumido por exportar_md:
-    {pagina_0based: {"blocos": [(texto, conf_media)], "manuscrito": bool}} —
-    só páginas com algo a registrar entram no dict."""
+    {pagina_0based: {"blocos": [(texto, conf_media)], "manuscrito": bool,
+    "origem": str}} — com OCR ligado, TODA página ganha entrada com a
+    "origem" do texto (atl.md §8): "texto nativo" / "camada e-proc
+    reaproveitada" / "OCR do LIMPAPDF" / "camada e-proc incompleta —
+    revisar"."""
     import os
     import pypdfium2 as pdfium
     import pytesseract
@@ -2330,12 +2371,29 @@ def embutir_ocr(pdf_path: Path, lang: str, cfg: str, workers: int = None,
             box = page.mediabox
             mx0, my0 = float(box[0]), float(box[1])
             mediabox = (mx0, my0, float(box[2]) - mx0, float(box[3]) - my0)
-            # Página com texto REALMENTE aproveitável: só as imagens embutidas
-            # (prints, anexos) passam por OCR de região. Caso contrário, OCR
-            # de página inteira — removendo antes a camada de texto podre
-            # (fonte sem /ToUnicode), senão a extração continuaria pegando o
-            # lixo em vez do texto do OCR.
-            if _texto_e_aproveitavel(existente):
+            # v2.10: UMA decisão por página (atl.md §5). Para o acervo do SIG
+            # os caminhos resultantes são IDÊNTICOS aos da v2.9 (garantido
+            # por tests/regressao/decisoes_ocr.py).
+            tipo, deficiente, bbox_scan = classificar_pagina(
+                page, doc[i], existente)
+            reusa = (tipo is TipoPagina.NATIVA_DIGITAL
+                     or (tipo is TipoPagina.HIBRIDA_COM_OCR
+                         and reocr_hibrido != "sempre"
+                         and not (reocr_hibrido == "auto" and deficiente)))
+            if reusa:
+                if tipo is TipoPagina.NATIVA_DIGITAL:
+                    origem = "texto nativo"
+                elif deficiente:
+                    origem = "camada e-proc incompleta — revisar"
+                    print(f"   [hibrido] pag {i + 1}: camada de OCR existente"
+                          " parece incompleta — considere --reocr-hibrido"
+                          " auto/sempre.", flush=True)
+                else:
+                    origem = "camada e-proc reaproveitada"
+                info[i] = {"blocos": [], "manuscrito": manuscrito,
+                           "origem": origem}
+                # caminho da v2.8/v2.9: OCR de região das imagens embutidas
+                # (prints, anexos) por cima do texto de corpo.
                 cands = [bbox for kind, _k, bbox, _ins, rot in (els or [])
                          if kind in ("I", "II") and bbox and not rot
                          and _imagem_candidata_ocr(bbox, W, H)]
@@ -2343,12 +2401,50 @@ def embutir_ocr(pdf_path: Path, lang: str, cfg: str, workers: int = None,
                     tarefas.append({"idx": i, "modo": "regioes",
                                     "escala": _escala_render(page),
                                     "mediabox": mediabox, "cands": cands})
-                elif manuscrito:
-                    info[i] = {"blocos": [], "manuscrito": True}
                 continue
-            if manuscrito:
-                info[i] = {"blocos": [], "manuscrito": True}
-            if len(existente) >= OCR_MIN_CHARS_AVAL:
+            if tipo is TipoPagina.HIBRIDA_COM_OCR:
+                info[i] = {"blocos": [], "manuscrito": manuscrito,
+                           "origem": "OCR do LIMPAPDF"}
+                if reocr_hibrido == "sempre":
+                    # atl.md §7: remove a camada existente e reOCRiza tudo.
+                    try:
+                        _remover_camada_texto(pdf, page)
+                    except Exception as e:
+                        print(f"   [aviso] nao removi a camada da pag"
+                              f" {i + 1}: {e}")
+                    tarefas.append({"idx": i, "modo": "pagina",
+                                    "escala": _escala_render(page),
+                                    "mediabox": mediabox, "cands": []})
+                    continue
+                # auto + deficiente: ADITIVO — nada é removido.
+                # Se o scan aparece como imagens candidatas VISÍVEIS (corpo
+                # fatiado em tiras do SIG), o caminho é o MESMO da v2.9 (OCR
+                # de região das candidatas) — decisão idêntica, regressão
+                # garantida. O caminho novo (região do scan detectado no
+                # Form XObject) só entra quando NÃO há candidatas visíveis:
+                # o arranjo do e-proc, invisível para _elementos.
+                cands = [bbox for kind, _k, bbox, _ins, rot in (els or [])
+                         if kind in ("I", "II") and bbox and not rot
+                         and _imagem_candidata_ocr(bbox, W, H)]
+                if cands:
+                    tarefas.append({"idx": i, "modo": "regioes",
+                                    "escala": _escala_render(page),
+                                    "mediabox": mediabox, "cands": cands})
+                else:
+                    print(f"   [hibrido] pag {i + 1}: camada existente"
+                          " incompleta; OCR proprio da regiao do scan.",
+                          flush=True)
+                    tarefas.append({"idx": i, "modo": "regioes",
+                                    "escala": _escala_render(page),
+                                    "mediabox": mediabox,
+                                    "cands": [bbox_scan], "hibrida": True})
+                continue
+            # TEXTO_CORROMPIDO / IMAGEM_SEM_OCR: OCR de página inteira,
+            # removendo antes a camada podre (fonte sem /ToUnicode), senão a
+            # extração continuaria pegando o lixo em vez do texto do OCR.
+            info[i] = {"blocos": [], "manuscrito": manuscrito,
+                       "origem": "OCR do LIMPAPDF"}
+            if tipo is TipoPagina.TEXTO_CORROMPIDO:
                 try:
                     if _remover_camada_texto(pdf, page):
                         print(f"   Pag {i + 1}: camada de texto corrompida"
@@ -2382,7 +2478,7 @@ def embutir_ocr(pdf_path: Path, lang: str, cfg: str, workers: int = None,
                 _ocr_camada(pdf, page, corpo)
                 n_ocr += 1
                 return
-            # regiões de imagem embutida
+            # regiões de imagem embutida (ou do scan da página híbrida)
             linhas_pag, blocos = [], []
             for reg in r["regs"]:
                 linhas, palavras, confs = _linhas_texto_ocr(
@@ -2397,12 +2493,22 @@ def embutir_ocr(pdf_path: Path, lang: str, cfg: str, workers: int = None,
                 blocos.append((texto, sum(confs) / len(confs)))
             if linhas_pag:
                 _ocr_camada(pdf, page, linhas_pag)
+            if r.get("hibrida"):
+                # página híbrida deficiente (v2.10): o texto do OCR fica só
+                # na camada invisível (sai no corpo do .md pela extração) —
+                # sem blocos de citação; a origem já foi registrada.
+                if linhas_pag:
+                    print(f"   OCR do scan da pagina hibrida {i + 1}...",
+                          flush=True)
+                    n_ocr += 1
+                return
             if blocos:
                 print(f"   OCR de imagem embutida na pagina {i + 1}"
                       f" ({len(blocos)} bloco(s))...", flush=True)
                 n_ocr += 1
             if blocos or manuscritos[i]:
-                info[i] = {"blocos": blocos, "manuscrito": manuscritos[i]}
+                info.setdefault(i, {}).update(
+                    {"blocos": blocos, "manuscrito": manuscritos[i]})
 
         n_workers = _ocr_workers_auto(
             workers if workers is not None and workers > 0 else OCR_WORKERS)
