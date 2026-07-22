@@ -143,7 +143,8 @@ def coletar():
     """Roda a limpeza atual sobre exemplos/ e coleta as métricas."""
     SAIDA.mkdir(parents=True, exist_ok=True)
     dados = {}
-    pdfs = [p for p in sorted(EXEMPLOS.glob("*.pdf")) if "LIMPO" not in p.stem]
+    pdfs = [p for p in sorted(EXEMPLOS.glob("*.pdf"))
+            if "limpo" not in p.stem.lower()]
     for pdf in pdfs:
         destino = SAIDA / pdf.name
         nucleo.limpa_pdf(pdf, destino, True)
