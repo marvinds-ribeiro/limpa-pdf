@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-limpa_pdf_mpsc.py — v2.9 — Limpeza em lote de PDFs exportados do SIG (Softplan/MPSC)
+limpa_pdf_mpsc.py — v2.10 — Limpeza em lote de PDFs exportados do SIG (Softplan/MPSC)
 
 Remove, em qualquer layout (GAECO, CAT, Promotorias...):
   1. Assinatura digital vertical da margem (texto rotacionado OU vetorizado) — sempre
@@ -15,6 +15,36 @@ Extras:
   --ocr     OCR (Tesseract) nas páginas sem texto aproveitável E nas imagens
             embutidas de páginas com texto (prints, documentos anexados)
   --max-mb  Divide o resultado em partes de até N MB (padrão 100; 0 = não)
+
+Novidades da v2.10 (suporte a PDFs do e-proc/TJSC — diagnóstico empírico em
+diag_eproc.py / RELATORIO_EPROC.md):
+  - CLASSIFICADOR DE TIPO DE PÁGINA (classificar_pagina, UMA decisão por
+    página, reusada no OCR e na exportação): NATIVA_DIGITAL (texto real, sem
+    scan) / HIBRIDA_COM_OCR (scan de página inteira + camada de texto
+    aproveitável — o caso e-proc) / IMAGEM_SEM_OCR (scan sem camada) /
+    TEXTO_CORROMPIDO (camada lixo: remove + OCR, como antes).
+  - DETECÇÃO DE SCAN EM FORM XOBJECT (_bbox_scan_form): o e-proc desenha o
+    scan DENTRO de um Form XObject (Do de /TPLn), invisível para
+    _iter_elementos — o texto extraível (~264 chars/página) é só a MOLDURA
+    (rodapé do e-proc + carimbo do SGP-e) e o corpo se perdia inteiro.
+    A detecção nova é usada SÓ pelo classificador; a limpeza não muda.
+  - SUFICIÊNCIA DA CAMADA POR DENSIDADE (FRAC_TEXTO_MIN_HIBRIDO=45, medido:
+    nativas boas 54,6-65,5 chars/1000 px de tinta; híbridas só-moldura
+    1,3-40,6): camada existente que diz muito menos do que a tinta visível
+    sugere é DEFICIENTE.
+  - FLAG --reocr-hibrido=auto|nunca|sempre (padrão auto): híbrida com camada
+    boa é REUSADA (rápido, respeita o OCR do tribunal); com camada deficiente
+    o OCR próprio roda ADITIVAMENTE na região do scan (nada é removido — a
+    moldura/camada existente fica; portão de qualidade em portao_eproc.py).
+    "nunca" sempre reusa (avisa se deficiente); "sempre" descarta a camada e
+    reOCRiza tudo (avisado: lento e pode não melhorar).
+  - ORIGEM POR PÁGINA NO .md: _[texto nativo]_ / _[camada e-proc
+    reaproveitada]_ / _[OCR do LIMPAPDF]_ / _[camada e-proc incompleta —
+    revisar]_ sob o cabeçalho de cada página.
+  - REGRESSÃO DE DECISÕES (tests/regressao/decisoes_ocr.py): decisão de OCR
+    por página do acervo do SIG é IDÊNTICA à v2.9 (baseline JSON; falha se
+    qualquer decisão mudar). planejar() conta as híbridas deficientes para a
+    barra de progresso (verificação em cascata, ms/página no SIG).
 
 Novidades da v2.9:
   - FIM DO "APAGOU DEMAIS" (diagnóstico empírico em auditoria_limpeza.py /
@@ -1757,6 +1787,10 @@ FRAC_TEXTO_MIN_HIBRIDO = 45.0
 # quando suficiente e roda OCR próprio só nas deficientes; "nunca" sempre
 # reusa (conservador puro); "sempre" força o reOCR (lento, pode não melhorar).
 REOCR_HIBRIDO_PADRAO = "auto"
+# planejar(): página com texto aproveitável MAIOR que isso nunca é híbrida
+# deficiente (molduras do e-proc medem 61-293 chars; 600 dá folga de 2x) —
+# evita pagar o render de densidade em todo o acervo nativo do SIG.
+PLAN_CHARS_VERIFICA_DENS = 600
 
 
 class TipoPagina(Enum):
@@ -2736,6 +2770,12 @@ def planejar(arquivos, com_ocr: bool = True, progresso=None):
     """Pré-passagem de planejamento (Tarefa B): para cada PDF, conta as
     páginas e QUANTAS realmente irão para o OCR de página inteira
     (_texto_e_aproveitavel num varrimento rápido de get_textpage — ms/página).
+    v2.10: páginas HÍBRIDAS deficientes (e-proc) também contam, senão a
+    barra de progresso mente. A verificação cara (render de densidade +
+    classificador) roda em CASCATA: só para páginas com texto aproveitável
+    CURTO (<= PLAN_CHARS_VERIFICA_DENS — molduras medidas: 61-293 chars),
+    e o pikepdf só abre se a densidade indicar candidata — no acervo do SIG
+    nativo nada disso dispara e o custo continua ms/página.
     Devolve uma lista de dicts {"arquivo", "paginas", "paginas_ocr",
     "unidades"} — um ORÇAMENTO exato de unidades de trabalho, não estimativa
     por arquivo. Nunca quebra: erro num arquivo vira orçamento aproximado."""
@@ -2745,6 +2785,7 @@ def planejar(arquivos, com_ocr: bool = True, progresso=None):
         n = n_ocr = 0
         try:
             doc = pdfium.PdfDocument(str(arq))
+            pdf_pike = None
             try:
                 n = len(doc)
                 for i in range(n):
@@ -2753,8 +2794,21 @@ def planejar(arquivos, com_ocr: bool = True, progresso=None):
                     tp.close()
                     if not _texto_e_aproveitavel(t):
                         n_ocr += 1
+                        continue
+                    if not com_ocr or len(t.strip()) > PLAN_CHARS_VERIFICA_DENS:
+                        continue
+                    if _densidade_texto(doc[i], t) >= FRAC_TEXTO_MIN_HIBRIDO:
+                        continue
+                    if pdf_pike is None:
+                        pdf_pike = pikepdf.open(arq)
+                    tipo, deficiente, _bx = classificar_pagina(
+                        pdf_pike.pages[i], doc[i], t)
+                    if tipo is TipoPagina.HIBRIDA_COM_OCR and deficiente:
+                        n_ocr += 1
             finally:
                 doc.close()
+                if pdf_pike is not None:
+                    pdf_pike.close()
         except Exception:
             n = max(n, 1)
             n_ocr = n
@@ -2831,7 +2885,20 @@ def main():
     ap.add_argument("--workers", type=int, default=0,
                     help="nº de processos de OCR em paralelo (0 = automático:"
                          " núcleos-1 com teto por RAM; 1 = sequencial)")
+    ap.add_argument("--reocr-hibrido", choices=("auto", "nunca", "sempre"),
+                    default=REOCR_HIBRIDO_PADRAO,
+                    help="páginas HÍBRIDAS (scan de página inteira + camada"
+                         " de texto já existente, ex.: e-proc/TJSC): 'auto'"
+                         " (padrão) reusa a camada quando suficiente e roda o"
+                         " OCR próprio, sem apagar nada, só quando ela é"
+                         " deficiente; 'nunca' sempre reusa; 'sempre' força o"
+                         " OCR próprio em todas (mais lento e pode não"
+                         " melhorar)")
     args = ap.parse_args()
+    if args.reocr_hibrido == "sempre":
+        print("[aviso] --reocr-hibrido=sempre: a camada de texto existente"
+              " das páginas híbridas será DESCARTADA e refeita pelo OCR"
+              " próprio — mais lento e pode não melhorar o resultado.")
 
     lang = cfg = None
     if args.ocr:
@@ -2867,8 +2934,9 @@ def main():
         info_ocr = {}
         if lang:
             try:
-                n_ocr, info_ocr = embutir_ocr(destino, lang, cfg,
-                                              workers=args.workers)
+                n_ocr, info_ocr = embutir_ocr(
+                    destino, lang, cfg, workers=args.workers,
+                    reocr_hibrido=args.reocr_hibrido)
                 if n_ocr:
                     print(f"   OCR embutido em {n_ocr} páginas (texto"
                           " selecionável).")

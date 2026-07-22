@@ -7,6 +7,10 @@ REM  A camada de texto do OCR fica posicionada exatamente sobre a
 REM  imagem (selecionavel e pesquisavel, alinhada ao que se ve).
 REM  Requer o programa Tesseract (o script o encontra sozinho e
 REM  baixa o idioma portugues se faltar). OCR a 300 dpi: ~3-6 s/pagina.
+REM  v2.10: PDFs do e-proc/TJSC (scan + camada de texto do tribunal) sao
+REM  tratados pelo flag --reocr-hibrido (padrao auto: reusa a camada boa e
+REM  roda OCR proprio so quando ela e deficiente). Para forcar ou proibir:
+REM    python limpa_pdf_mpsc.py <pasta> --reocr-hibrido sempre|nunca ...
 REM ============================================================
 if "%~1"=="" (
   echo Arraste uma pasta com PDFs ^(ou um PDF^) para cima deste arquivo.
